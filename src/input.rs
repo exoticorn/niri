@@ -840,6 +840,19 @@ impl State {
 
         let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
 
+        if let Some(window) = self.niri.window_under(pos) {
+            let window = window.clone();
+            self.niri.layout.activate_window(&window);
+
+            // FIXME: granular.
+            self.niri.queue_redraw_all();
+        } else {
+            self.niri.layout.activate_output(&output);
+
+            // FIXME: granular.
+            self.niri.queue_redraw_all();
+        }
+
         let serial = SERIAL_COUNTER.next_serial();
 
         let under = self.niri.surface_under_and_global_space(pos);
