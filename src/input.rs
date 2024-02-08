@@ -7,7 +7,7 @@ use smithay::backend::input::{
     GestureBeginEvent, GestureEndEvent, GesturePinchUpdateEvent as _, GestureSwipeUpdateEvent as _,
     InputBackend, InputEvent, KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
     PointerMotionEvent, ProximityState, TabletToolButtonEvent, TabletToolEvent,
-    TabletToolProximityEvent, TabletToolTipEvent, TabletToolTipState,
+    TabletToolProximityEvent, TabletToolTipEvent, TabletToolTipState, TouchEvent,
 };
 use smithay::backend::libinput::LibinputInputBackend;
 use smithay::input::keyboard::{keysyms, FilterResult, Keysym, ModifiersState};
@@ -85,9 +85,9 @@ impl State {
             GesturePinchEnd { event } => self.on_gesture_pinch_end::<I>(event),
             GestureHoldBegin { event } => self.on_gesture_hold_begin::<I>(event),
             GestureHoldEnd { event } => self.on_gesture_hold_end::<I>(event),
-            TouchDown { .. } => (),
-            TouchMotion { .. } => (),
-            TouchUp { .. } => (),
+            TouchDown { event } => self.on_touch_down::<I>(event),
+            TouchMotion { event } => self.on_touch_motion::<I>(event),
+            TouchUp { event } => self.on_touch_up::<I>(event),
             TouchCancel { .. } => (),
             TouchFrame { .. } => (),
             SwitchToggle { .. } => (),
@@ -155,6 +155,9 @@ impl State {
             let desc = TabletDescriptor::from(&device);
             tablet_seat.add_tablet::<Self>(&self.niri.display_handle, &desc);
         }
+        if device.has_capability(DeviceCapability::Touch) {
+            self.niri.seat.add_touch();
+        }
     }
 
     fn on_device_removed(&mut self, device: impl Device) {
@@ -168,6 +171,9 @@ impl State {
             if tablet_seat.count_tablets() == 0 {
                 tablet_seat.clear_tools();
             }
+        }
+        if device.has_capability(DeviceCapability::Touch) {
+            self.niri.seat.remove_touch();
         }
     }
 
@@ -823,6 +829,60 @@ impl State {
         // Redraw to update the cursor position.
         // FIXME: redraw only outputs overlapping the cursor.
         self.niri.queue_redraw_all();
+    }
+
+    fn on_touch_down<I: InputBackend>(&mut self, event: I::TouchDownEvent) {
+        let Some(output) = self.niri.global_space.outputs().next() else {
+            return;
+        };
+
+        let output_geo = self.niri.global_space.output_geometry(output).unwrap();
+
+        let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
+
+        let serial = SERIAL_COUNTER.next_serial();
+
+        let under = self.niri.surface_under_and_global_space(pos);
+
+        if let Some(under) = under {
+            let pos = pos - under.surface.1.to_f64();
+            if let Some(touch) = self.niri.seat.get_touch() {
+                touch.down(
+                    serial,
+                    event.time_msec(),
+                    &under.surface.0,
+                    pos,
+                    event.slot(),
+                );
+            }
+        }
+    }
+
+    fn on_touch_motion<I: InputBackend>(&mut self, event: I::TouchMotionEvent) {
+        let Some(output) = self.niri.global_space.outputs().next() else {
+            return;
+        };
+
+        let output_geo = self.niri.global_space.output_geometry(output).unwrap();
+
+        let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
+
+        let under = self.niri.surface_under_and_global_space(pos);
+
+        if let Some(under) = under {
+            let pos = pos - under.surface.1.to_f64();
+            if let Some(touch) = self.niri.seat.get_touch() {
+                touch.motion(event.time_msec(), event.slot(), pos);
+            }
+        }
+    }
+
+    fn on_touch_up<I: InputBackend>(&mut self, event: I::TouchUpEvent) {
+        let serial = SERIAL_COUNTER.next_serial();
+
+        if let Some(touch) = self.niri.seat.get_touch() {
+            touch.up(serial, event.time_msec(), event.slot());
+        }
     }
 
     fn on_pointer_motion_absolute<I: InputBackend>(
