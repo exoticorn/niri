@@ -17,6 +17,7 @@ use smithay::input::pointer::{
     GestureSwipeEndEvent, GestureSwipeUpdateEvent, MotionEvent, RelativeMotionEvent,
 };
 use smithay::reexports::input;
+use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
 use smithay::wayland::tablet_manager::{TabletDescriptor, TabletSeatTrait};
@@ -173,6 +174,16 @@ impl State {
             }
         }
         if device.has_capability(DeviceCapability::Touch) {
+            // remove all touch surfaces
+            for (slot, _) in self.niri.touch_surfaces.drain() {
+                // TODO: check whether we actually need to send up events for active touches
+                if let Some(touch) = self.niri.seat.get_touch() {
+                    let serial = SERIAL_COUNTER.next_serial();
+                    // FIXME: timestamp
+                    touch.up(serial, 0, slot);
+                }
+            }
+            // FIXME: this should be reference counted, in case there are multiple touch devices
             self.niri.seat.remove_touch();
         }
     }
@@ -832,6 +843,7 @@ impl State {
     }
 
     fn on_touch_down<I: InputBackend>(&mut self, event: I::TouchDownEvent) {
+        // FIXME: assign an output to each touch device
         let Some(output) = self.niri.global_space.outputs().next() else {
             return;
         };
@@ -858,32 +870,45 @@ impl State {
         let under = self.niri.surface_under_and_global_space(pos);
 
         if let Some(under) = under {
-            let pos = pos - under.surface.1.to_f64();
+            let (surface, surface_pos) = under.surface;
+            let pos = pos - surface_pos.to_f64();
             if let Some(touch) = self.niri.seat.get_touch() {
-                touch.down(
-                    serial,
-                    event.time_msec(),
-                    &under.surface.0,
-                    pos,
-                    event.slot(),
-                );
+                touch.down(serial, event.time_msec(), &surface, pos, event.slot());
+
+                self.niri.touch_surfaces.insert(event.slot(), surface);
             }
         }
     }
 
     fn on_touch_motion<I: InputBackend>(&mut self, event: I::TouchMotionEvent) {
+        // FIXME: assign an output to each touch device
         let Some(output) = self.niri.global_space.outputs().next() else {
             return;
         };
 
         let output_geo = self.niri.global_space.output_geometry(output).unwrap();
 
+        let Some(touch_surface) = self.niri.touch_surfaces.get(&event.slot()) else {
+            return;
+        };
+        if !touch_surface.is_alive() {
+            self.niri.touch_surfaces.remove(&event.slot());
+            return;
+        }
+
+        let touch_surface_id = touch_surface.id();
+
         let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
 
+        // FIXME: retrieve position of touch_surface without searching using pos
         let under = self.niri.surface_under_and_global_space(pos);
 
         if let Some(under) = under {
-            let pos = pos - under.surface.1.to_f64();
+            let (surface, surface_pos) = under.surface;
+            if surface.id() != touch_surface_id {
+                return;
+            }
+            let pos = pos - surface_pos.to_f64();
             if let Some(touch) = self.niri.seat.get_touch() {
                 touch.motion(event.time_msec(), event.slot(), pos);
             }
@@ -892,6 +917,8 @@ impl State {
 
     fn on_touch_up<I: InputBackend>(&mut self, event: I::TouchUpEvent) {
         let serial = SERIAL_COUNTER.next_serial();
+
+        self.niri.touch_surfaces.remove(&event.slot());
 
         if let Some(touch) = self.niri.seat.get_touch() {
             touch.up(serial, event.time_msec(), event.slot());

@@ -13,6 +13,7 @@ use anyhow::Context;
 use calloop::futures::Scheduler;
 use niri_config::{Config, TrackLayout};
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::input::TouchSlot;
 use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
 use smithay::backend::renderer::element::solid::{SolidColorBuffer, SolidColorRenderElement};
 use smithay::backend::renderer::element::surface::{
@@ -182,6 +183,8 @@ pub struct Niri {
     pub dnd_icon: Option<WlSurface>,
     pub pointer_focus: Option<PointerFocus>,
     pub tablet_cursor_location: Option<Point<f64, Logical>>,
+
+    pub touch_surfaces: HashMap<TouchSlot, WlSurface>,
 
     pub lock_state: LockState,
 
@@ -1023,6 +1026,8 @@ impl Niri {
             dnd_icon: None,
             pointer_focus: None,
             tablet_cursor_location: None,
+
+            touch_surfaces: HashMap::new(),
 
             lock_state: LockState::Unlocked,
 
