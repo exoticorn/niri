@@ -185,6 +185,7 @@ pub struct Niri {
     pub tablet_cursor_location: Option<Point<f64, Logical>>,
 
     pub touch_surface_positions: HashMap<TouchSlot, Point<i32, Logical>>,
+    pub touch_device_count: usize,
 
     pub lock_state: LockState,
 
@@ -1028,6 +1029,7 @@ impl Niri {
             tablet_cursor_location: None,
 
             touch_surface_positions: HashMap::new(),
+            touch_device_count: 0,
 
             lock_state: LockState::Unlocked,
 

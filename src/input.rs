@@ -156,7 +156,10 @@ impl State {
             tablet_seat.add_tablet::<Self>(&self.niri.display_handle, &desc);
         }
         if device.has_capability(DeviceCapability::Touch) {
-            self.niri.seat.add_touch();
+            if self.niri.touch_device_count == 0 {
+                self.niri.seat.add_touch();
+            }
+            self.niri.touch_device_count += 1;
         }
     }
 
@@ -182,8 +185,10 @@ impl State {
                     touch.up(serial, 0, slot);
                 }
             }
-            // FIXME: this should be reference counted, in case there are multiple touch devices
-            self.niri.seat.remove_touch();
+            self.niri.touch_device_count = self.niri.touch_device_count.saturating_sub(1);
+            if self.niri.touch_device_count == 0 {
+                self.niri.seat.remove_touch();
+            }
         }
     }
 
