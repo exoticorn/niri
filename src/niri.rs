@@ -184,7 +184,7 @@ pub struct Niri {
     pub pointer_focus: Option<PointerFocus>,
     pub tablet_cursor_location: Option<Point<f64, Logical>>,
 
-    pub touch_surfaces: HashMap<TouchSlot, WlSurface>,
+    pub touch_surface_positions: HashMap<TouchSlot, Point<i32, Logical>>,
 
     pub lock_state: LockState,
 
@@ -1027,7 +1027,7 @@ impl Niri {
             pointer_focus: None,
             tablet_cursor_location: None,
 
-            touch_surfaces: HashMap::new(),
+            touch_surface_positions: HashMap::new(),
 
             lock_state: LockState::Unlocked,
 

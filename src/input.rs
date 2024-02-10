@@ -17,7 +17,6 @@ use smithay::input::pointer::{
     GestureSwipeEndEvent, GestureSwipeUpdateEvent, MotionEvent, RelativeMotionEvent,
 };
 use smithay::reexports::input;
-use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
 use smithay::wayland::tablet_manager::{TabletDescriptor, TabletSeatTrait};
@@ -175,7 +174,7 @@ impl State {
         }
         if device.has_capability(DeviceCapability::Touch) {
             // remove all touch surfaces
-            for (slot, _) in self.niri.touch_surfaces.drain() {
+            for (slot, _) in self.niri.touch_surface_positions.drain() {
                 // TODO: check whether we actually need to send up events for active touches
                 if let Some(touch) = self.niri.seat.get_touch() {
                     let serial = SERIAL_COUNTER.next_serial();
@@ -875,7 +874,9 @@ impl State {
             if let Some(touch) = self.niri.seat.get_touch() {
                 touch.down(serial, event.time_msec(), &surface, pos, event.slot());
 
-                self.niri.touch_surfaces.insert(event.slot(), surface);
+                self.niri
+                    .touch_surface_positions
+                    .insert(event.slot(), surface_pos);
             }
         }
     }
@@ -888,37 +889,21 @@ impl State {
 
         let output_geo = self.niri.global_space.output_geometry(output).unwrap();
 
-        let Some(touch_surface) = self.niri.touch_surfaces.get(&event.slot()) else {
+        let Some(&surface_pos) = self.niri.touch_surface_positions.get(&event.slot()) else {
             return;
         };
-        if !touch_surface.is_alive() {
-            self.niri.touch_surfaces.remove(&event.slot());
-            return;
-        }
-
-        let touch_surface_id = touch_surface.id();
-
         let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
 
-        // FIXME: retrieve position of touch_surface without searching using pos
-        let under = self.niri.surface_under_and_global_space(pos);
-
-        if let Some(under) = under {
-            let (surface, surface_pos) = under.surface;
-            if surface.id() != touch_surface_id {
-                return;
-            }
-            let pos = pos - surface_pos.to_f64();
-            if let Some(touch) = self.niri.seat.get_touch() {
-                touch.motion(event.time_msec(), event.slot(), pos);
-            }
+        let pos = pos - surface_pos.to_f64();
+        if let Some(touch) = self.niri.seat.get_touch() {
+            touch.motion(event.time_msec(), event.slot(), pos);
         }
     }
 
     fn on_touch_up<I: InputBackend>(&mut self, event: I::TouchUpEvent) {
         let serial = SERIAL_COUNTER.next_serial();
 
-        self.niri.touch_surfaces.remove(&event.slot());
+        self.niri.touch_surface_positions.remove(&event.slot());
 
         if let Some(touch) = self.niri.seat.get_touch() {
             touch.up(serial, event.time_msec(), event.slot());
