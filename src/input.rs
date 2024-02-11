@@ -16,6 +16,7 @@ use smithay::input::pointer::{
     GesturePinchBeginEvent, GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent,
     GestureSwipeEndEvent, GestureSwipeUpdateEvent, MotionEvent, RelativeMotionEvent,
 };
+use smithay::output::Output;
 use smithay::reexports::input;
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
@@ -34,6 +35,13 @@ pub enum CompositorMod {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TabletData {
     pub aspect_ratio: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TouchData {
+    pub is_internal_device: bool,
+    pub output_name: Option<String>,
+    pub output: Option<Output>,
 }
 
 impl State {
@@ -138,11 +146,27 @@ impl State {
                     }
                 }
 
+                if device.has_capability(input::DeviceCapability::Touch) {
+                    // let device_id = ???;
+                    // let is_internal_device = device_id.starts_with("platform-")
+                    //     || (device_id.starts_with("pci-") && device_id.contains("-platform-"));
+                    let is_internal_device = true;
+                    let output_name = device.output_name().map(|n| n.to_owned());
+                    let mut touch_data = TouchData {
+                        is_internal_device,
+                        output_name,
+                        output: None,
+                    };
+                    touch_data.output = self.niri.find_output_for_touch_device(&touch_data);
+                    self.niri.touch_devices.insert(device.clone(), touch_data);
+                }
+
                 apply_libinput_settings(&self.niri.config.borrow().input, device);
             }
             InputEvent::DeviceRemoved { device } => {
                 self.niri.tablets.remove(device);
                 self.niri.devices.remove(device);
+                self.niri.touch_devices.remove(device);
             }
             _ => (),
         }
@@ -846,15 +870,41 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
-    fn on_touch_down<I: InputBackend>(&mut self, event: I::TouchDownEvent) {
-        // FIXME: assign an output to each touch device
-        let Some(output) = self.niri.global_space.outputs().next() else {
-            return;
+    fn compute_touch_position<I: InputBackend>(
+        &self,
+        event: &(impl Event<I> + AbsolutePositionEvent<I>),
+    ) -> Option<(Output, Point<f64, Logical>)>
+    where
+        I::Device: 'static,
+    {
+        let device = event.device();
+        let output = if let Some(device) = (&device as &dyn Any).downcast_ref::<input::Device>() {
+            self.niri
+                .touch_devices
+                .get(device)
+                .and_then(|d| d.output.as_ref())
+        } else {
+            self.niri.global_space.outputs().next()
+        };
+
+        let Some(output) = output else {
+            return None;
         };
 
         let output_geo = self.niri.global_space.output_geometry(output).unwrap();
 
         let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
+
+        return Some((output.clone(), pos));
+    }
+
+    fn on_touch_down<I: InputBackend>(&mut self, event: I::TouchDownEvent)
+    where
+        I::Device: 'static, // Needed for downcasting.
+    {
+        let Some((output, pos)) = self.compute_touch_position(&event) else {
+            return;
+        };
 
         if let Some(window) = self.niri.window_under(pos) {
             let window = window.clone();
@@ -886,19 +936,17 @@ impl State {
         }
     }
 
-    fn on_touch_motion<I: InputBackend>(&mut self, event: I::TouchMotionEvent) {
-        // FIXME: assign an output to each touch device
-        let Some(output) = self.niri.global_space.outputs().next() else {
+    fn on_touch_motion<I: InputBackend>(&mut self, event: I::TouchMotionEvent)
+    where
+        I::Device: 'static, // Needed for downcasting.
+    {
+        let Some((_, pos)) = self.compute_touch_position(&event) else {
             return;
         };
-
-        let output_geo = self.niri.global_space.output_geometry(output).unwrap();
 
         let Some(&surface_pos) = self.niri.touch_surface_positions.get(&event.slot()) else {
             return;
         };
-        let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
-
         let pos = pos - surface_pos.to_f64();
         if let Some(touch) = self.niri.seat.get_touch() {
             touch.motion(event.time_msec(), event.slot(), pos);

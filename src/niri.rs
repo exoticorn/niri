@@ -95,7 +95,7 @@ use crate::exit_confirm_dialog::ExitConfirmDialog;
 use crate::frame_clock::FrameClock;
 use crate::handlers::configure_lock_surface;
 use crate::hotkey_overlay::HotkeyOverlay;
-use crate::input::{apply_libinput_settings, TabletData};
+use crate::input::{apply_libinput_settings, TabletData, TouchData};
 use crate::ipc::server::IpcServer;
 use crate::layout::{Layout, MonitorRenderElement};
 use crate::protocols::foreign_toplevel::{self, ForeignToplevelManagerState};
@@ -141,6 +141,7 @@ pub struct Niri {
 
     pub devices: HashSet<input::Device>,
     pub tablets: HashMap<input::Device, TabletData>,
+    pub touch_devices: HashMap<input::Device, TouchData>,
 
     // Smithay state.
     pub compositor_state: CompositorState,
@@ -991,6 +992,7 @@ impl Niri {
 
             devices: HashSet::new(),
             tablets: HashMap::new(),
+            touch_devices: HashMap::new(),
 
             compositor_state,
             xdg_shell_state,
@@ -2906,6 +2908,37 @@ impl Niri {
         if let Err(err) = res {
             warn!("error spawning a thread to send MonitorsChanged: {err:?}");
         }
+    }
+
+    pub fn find_output_for_touch_device(&self, touch_device: &TouchData) -> Option<Output> {
+        println!("device: {:?}", touch_device);
+        self.global_space
+            .outputs()
+            .filter_map(|output| {
+                let score = if let Some(ref name) = touch_device.output_name {
+                    if output.name() == *name {
+                        Some(256)
+                    } else {
+                        None
+                    }
+                } else if touch_device.is_internal_device {
+                    let output_name = output.name();
+                    if output_name.starts_with("eDP-")
+                        || output_name.starts_with("LVDS-")
+                        || output_name.starts_with("DSI-")
+                    {
+                        Some(1)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                println!("output: {:?}, score: {:?}", output, score);
+                score.map(|score| (output, score))
+            })
+            .max_by_key(|(_, score)| *score)
+            .map(|(output, _)| output.clone())
     }
 }
 
