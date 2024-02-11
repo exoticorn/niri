@@ -697,6 +697,10 @@ impl State {
             self.niri.reposition_outputs(None);
 
             self.backend.on_output_config_changed(&mut self.niri);
+
+            if let Some(touch) = self.niri.seat.get_touch() {
+                touch.cancel(self);
+            }
         }
 
         // Can't really update xdg-decoration settings since we have to hide the globals for CSD
