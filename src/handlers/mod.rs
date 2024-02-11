@@ -61,6 +61,7 @@ use crate::utils::output_size;
 impl SeatHandler for State {
     type KeyboardFocus = WlSurface;
     type PointerFocus = WlSurface;
+    type TouchFocus = WlSurface;
 
     fn seat_state(&mut self) -> &mut SeatState<State> {
         &mut self.niri.seat_state
