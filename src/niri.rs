@@ -191,6 +191,7 @@ pub struct Niri {
     pub tablet_cursor_location: Option<Point<f64, Logical>>,
 
     pub lock_state: LockState,
+    pub tablet_mode: bool,
 
     pub screenshot_ui: ScreenshotUi,
     pub config_error_notification: ConfigErrorNotification,
@@ -1039,6 +1040,7 @@ impl Niri {
             tablet_cursor_location: None,
 
             lock_state: LockState::Unlocked,
+            tablet_mode: false,
 
             screenshot_ui,
             config_error_notification,

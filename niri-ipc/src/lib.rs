@@ -201,6 +201,8 @@ pub enum Action {
     MoveWorkspaceToMonitorUp,
     /// Toggle a debug tint on windows.
     ToggleDebugTint,
+    /// Toggle tablet mode (disable keyboard and touchpad)
+    ToggleTabletMode,
 }
 
 /// Change in window or column size.

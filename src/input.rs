@@ -267,6 +267,7 @@ impl State {
                     *mods,
                     &this.niri.screenshot_ui,
                     this.niri.config.borrow().input.disable_power_key_handling,
+                    this.niri.tablet_mode,
                 )
             },
         ) else {
@@ -313,6 +314,9 @@ impl State {
             Action::ToggleDebugTint => {
                 self.backend.toggle_debug_tint();
                 self.niri.queue_redraw_all();
+            }
+            Action::ToggleTabletMode => {
+                self.niri.tablet_mode = !self.niri.tablet_mode;
             }
             Action::Spawn(command) => {
                 spawn(command);
@@ -671,6 +675,10 @@ impl State {
     }
 
     fn on_pointer_motion<I: InputBackend>(&mut self, event: I::PointerMotionEvent) {
+        if self.niri.tablet_mode {
+            return;
+        }
+
         // We need an output to be able to move the pointer.
         if self.niri.global_space.outputs().next().is_none() {
             return;
@@ -906,6 +914,10 @@ impl State {
     }
 
     fn on_pointer_button<I: InputBackend>(&mut self, event: I::PointerButtonEvent) {
+        if self.niri.tablet_mode {
+            return;
+        }
+
         let pointer = self.niri.seat.get_pointer().unwrap();
 
         let serial = SERIAL_COUNTER.next_serial();
@@ -971,6 +983,9 @@ impl State {
     }
 
     fn on_pointer_axis<I: InputBackend>(&mut self, event: I::PointerAxisEvent) {
+        if self.niri.tablet_mode {
+            return;
+        }
         let source = event.source();
 
         let horizontal_amount = event
@@ -1444,6 +1459,7 @@ fn should_intercept_key(
     mods: ModifiersState,
     screenshot_ui: &ScreenshotUi,
     disable_power_key_handling: bool,
+    tablet_mode: bool,
 ) -> FilterResult<Option<Action>> {
     // Actions are only triggered on presses, release of the key
     // shouldn't try to intercept anything unless we have marked
@@ -1460,6 +1476,13 @@ fn should_intercept_key(
         mods,
         disable_power_key_handling,
     );
+
+    if tablet_mode {
+        if final_action != Some(Action::ToggleTabletMode) {
+            suppressed_keys.insert(key_code);
+            return FilterResult::Intercept(None);
+        }
+    }
 
     // Allow only a subset of compositor actions while the screenshot UI is open, since the user
     // cannot see the screen.
@@ -1719,6 +1742,7 @@ mod tests {
 
         let screenshot_ui = ScreenshotUi::new();
         let disable_power_key_handling = false;
+        let tablet_mode = false;
 
         // The key_code we pick is arbitrary, the only thing
         // that matters is that they are different between cases.
@@ -1736,6 +1760,7 @@ mod tests {
                 mods,
                 &screenshot_ui,
                 disable_power_key_handling,
+                tablet_mode,
             )
         };
 
@@ -1752,6 +1777,7 @@ mod tests {
                 mods,
                 &screenshot_ui,
                 disable_power_key_handling,
+                tablet_mode,
             )
         };
 
