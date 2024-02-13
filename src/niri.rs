@@ -1673,6 +1673,10 @@ impl Niri {
         renderer: &mut R,
         output: &Output,
     ) -> Vec<OutputRenderElements<R>> {
+        if self.tablet_mode && self.tablet_cursor_location.is_none() {
+            return vec![];
+        }
+
         let _span = tracy_client::span!("Niri::pointer_element");
         let output_scale = output.current_scale();
         let output_pos = self.global_space.output_geometry(output).unwrap().loc;

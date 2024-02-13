@@ -317,6 +317,8 @@ impl State {
             }
             Action::ToggleTabletMode => {
                 self.niri.tablet_mode = !self.niri.tablet_mode;
+                // FIXME: redraw only outputs overlapping the cursor.
+                self.niri.queue_redraw_all();
             }
             Action::Spawn(command) => {
                 spawn(command);
