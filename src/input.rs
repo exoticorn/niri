@@ -7,7 +7,7 @@ use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisSource, ButtonState, Device, DeviceCapability, Event,
     GestureBeginEvent, GestureEndEvent, GesturePinchUpdateEvent as _, GestureSwipeUpdateEvent as _,
     InputBackend, InputEvent, KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
-    PointerMotionEvent, ProximityState, TabletToolButtonEvent, TabletToolEvent,
+    PointerMotionEvent, ProximityState, SwitchToggleEvent, TabletToolButtonEvent, TabletToolEvent,
     TabletToolProximityEvent, TabletToolTipEvent, TabletToolTipState, TouchEvent,
 };
 use smithay::backend::libinput::LibinputInputBackend;
@@ -107,7 +107,7 @@ impl State {
             TouchMotion { event } => self.on_touch_motion::<I>(event),
             TouchFrame { event } => self.on_touch_frame::<I>(event),
             TouchCancel { event } => self.on_touch_cancel::<I>(event),
-            SwitchToggle { .. } => (),
+            SwitchToggle { event } => self.on_switch_toggle::<I>(event),
             Special(_) => (),
         }
 
@@ -1443,6 +1443,14 @@ impl State {
             return;
         };
         handle.cancel(self);
+    }
+
+    fn on_switch_toggle<B: InputBackend>(&mut self, event: B::SwitchToggleEvent) {
+        if event.switch() == Some(smithay::backend::input::Switch::TabletMode) {
+            self.niri.tablet_mode = event.state() == smithay::backend::input::SwitchState::On;
+            // FIXME: redraw only outputs overlapping the cursor.
+            self.niri.queue_redraw_all();
+        }
     }
 }
 
