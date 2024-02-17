@@ -17,9 +17,9 @@ use smithay::input::pointer::{
     GesturePinchBeginEvent, GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent,
     GestureSwipeEndEvent, GestureSwipeUpdateEvent, MotionEvent, RelativeMotionEvent,
 };
-use smithay::input::touch::{DownEvent, UpEvent};
+use smithay::input::touch::{DownEvent, MotionEvent as TouchMotionEvent, UpEvent};
 use smithay::reexports::input;
-use smithay::utils::{Logical, Point, Rectangle, SERIAL_COUNTER};
+use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
 use smithay::wayland::tablet_manager::{TabletDescriptor, TabletSeatTrait};
 
@@ -286,6 +286,10 @@ impl State {
     pub fn do_action(&mut self, action: Action) {
         if self.niri.is_locked() && !allowed_when_locked(&action) {
             return;
+        }
+
+        if let Some(touch) = self.niri.seat.get_touch() {
+            touch.cancel(self);
         }
 
         match action {
@@ -1376,42 +1380,57 @@ impl State {
         );
     }
 
-    fn touch_output_geometry(&self) -> Option<Rectangle<i32, Logical>> {
-        self.niri
+    fn touch_location_transformed<I: InputBackend, E: AbsolutePositionEvent<I>>(
+        &self,
+        evt: &E,
+    ) -> Option<Point<f64, Logical>> {
+        let output = self
+            .niri
             .global_space
             .outputs()
             .find(|output| output.name().starts_with("eDP"))
-            .or_else(|| self.niri.global_space.outputs().next())
-            .map(|o| self.niri.global_space.output_geometry(o).unwrap())
+            .or_else(|| self.niri.global_space.outputs().next());
+
+        let Some(output) = output else {
+            return None;
+        };
+
+        let Some(output_geometry) = self.niri.global_space.output_geometry(output) else {
+            return None;
+        };
+
+        let transform = output.current_transform();
+        let size = transform.invert().transform_size(output_geometry.size);
+        Some(
+            transform.transform_point_in(evt.position_transformed(size), &size.to_f64())
+                + output_geometry.loc.to_f64(),
+        )
     }
 
-    fn on_touch_down<B: InputBackend>(&mut self, evt: B::TouchDownEvent) {
+    fn on_touch_down<I: InputBackend>(&mut self, evt: I::TouchDownEvent) {
         let Some(handle) = self.niri.seat.get_touch() else {
             return;
         };
-        let Some(output_geometry) = self.touch_output_geometry() else {
+        let Some(touch_location) = self.touch_location_transformed(&evt) else {
             return;
         };
-
-        let pointer_location =
-            evt.position_transformed(output_geometry.size) + output_geometry.loc.to_f64();
         let serial = SERIAL_COUNTER.next_serial();
         let under = self
             .niri
-            .surface_under_and_global_space(pointer_location)
+            .surface_under_and_global_space(touch_location)
             .map(|under| under.surface);
         handle.down(
             self,
             under,
             &DownEvent {
-                id: evt.slot(),
-                location: pointer_location,
+                slot: evt.slot(),
+                location: touch_location,
                 serial,
                 time: evt.time_msec(),
             },
         );
     }
-    fn on_touch_up<B: InputBackend>(&mut self, evt: B::TouchUpEvent) {
+    fn on_touch_up<I: InputBackend>(&mut self, evt: I::TouchUpEvent) {
         let Some(handle) = self.niri.seat.get_touch() else {
             return;
         };
@@ -1419,38 +1438,40 @@ impl State {
         handle.up(
             self,
             &UpEvent {
-                id: evt.slot(),
+                slot: evt.slot(),
                 serial,
                 time: evt.time_msec(),
             },
         )
     }
-    fn on_touch_motion<B: InputBackend>(&mut self, evt: B::TouchMotionEvent) {
+    fn on_touch_motion<I: InputBackend>(&mut self, evt: I::TouchMotionEvent) {
         let Some(handle) = self.niri.seat.get_touch() else {
             return;
         };
-        let Some(output_geometry) = self.touch_output_geometry() else {
+        let Some(touch_location) = self.touch_location_transformed(&evt) else {
             return;
         };
-
-        let pointer_location =
-            evt.position_transformed(output_geometry.size) + output_geometry.loc.to_f64();
+        let under = self
+            .niri
+            .surface_under_and_global_space(touch_location)
+            .map(|under| under.surface);
         handle.motion(
             self,
-            &smithay::input::touch::MotionEvent {
-                id: evt.slot(),
-                location: pointer_location,
+            under,
+            &TouchMotionEvent {
+                slot: evt.slot(),
+                location: touch_location,
                 time: evt.time_msec(),
             },
         );
     }
-    fn on_touch_frame<B: InputBackend>(&mut self, _evt: B::TouchFrameEvent) {
+    fn on_touch_frame<I: InputBackend>(&mut self, _evt: I::TouchFrameEvent) {
         let Some(handle) = self.niri.seat.get_touch() else {
             return;
         };
         handle.frame(self);
     }
-    fn on_touch_cancel<B: InputBackend>(&mut self, _evt: B::TouchCancelEvent) {
+    fn on_touch_cancel<I: InputBackend>(&mut self, _evt: I::TouchCancelEvent) {
         let Some(handle) = self.niri.seat.get_touch() else {
             return;
         };
