@@ -46,7 +46,7 @@ impl Layout {
                 off: true,
                 ..Default::default()
             },
-            border: niri_config::FocusRing {
+            border: niri_config::Border {
                 off: false,
                 width: 4,
                 active_color: Color::new(255, 163, 72, 255),
@@ -143,7 +143,8 @@ impl Layout {
     }
 
     fn add_window(&mut self, window: TestWindow, width: Option<ColumnWidth>) {
-        self.layout.add_window(window.clone(), width, false);
+        self.layout
+            .add_window(window.clone(), width.map(Some), false);
         if window.communicate() {
             self.layout.update_window(&window);
         }
@@ -157,7 +158,7 @@ impl Layout {
         width: Option<ColumnWidth>,
     ) {
         self.layout
-            .add_window_right_of(right_of, window.clone(), width, false);
+            .add_window_right_of(right_of, window.clone(), width.map(Some), false);
         if window.communicate() {
             self.layout.update_window(&window);
         }

@@ -153,7 +153,7 @@ pub struct Options {
     /// Extra padding around the working area in logical pixels.
     pub struts: Struts,
     pub focus_ring: niri_config::FocusRing,
-    pub border: niri_config::FocusRing,
+    pub border: niri_config::Border,
     pub center_focused_column: CenterFocusedColumn,
     /// Column widths that `toggle_width()` switches between.
     pub preset_widths: Vec<ColumnWidth>,
@@ -168,7 +168,7 @@ impl Default for Options {
             gaps: 16,
             struts: Default::default(),
             focus_ring: Default::default(),
-            border: niri_config::default_border(),
+            border: Default::default(),
             center_focused_column: Default::default(),
             preset_widths: vec![
                 ColumnWidth::Proportion(1. / 3.),
@@ -531,12 +531,15 @@ impl<W: LayoutElement> Layout<W> {
     pub fn add_window(
         &mut self,
         window: W,
-        width: Option<ColumnWidth>,
+        width: Option<Option<ColumnWidth>>,
         is_full_width: bool,
     ) -> Option<&Output> {
-        let width = width
-            .or(self.options.default_width)
-            .unwrap_or_else(|| ColumnWidth::Fixed(window.size().w));
+        let width = match width {
+            Some(Some(width)) => Some(width),
+            Some(None) => None,
+            None => self.options.default_width,
+        }
+        .unwrap_or_else(|| ColumnWidth::Fixed(window.size().w));
 
         match &mut self.monitor_set {
             MonitorSet::Normal {
@@ -584,12 +587,15 @@ impl<W: LayoutElement> Layout<W> {
         &mut self,
         right_of: &W,
         window: W,
-        width: Option<ColumnWidth>,
+        width: Option<Option<ColumnWidth>>,
         is_full_width: bool,
     ) -> Option<&Output> {
-        let width = width
-            .or(self.options.default_width)
-            .unwrap_or_else(|| ColumnWidth::Fixed(window.size().w));
+        let width = match width {
+            Some(Some(width)) => Some(width),
+            Some(None) => None,
+            None => self.options.default_width,
+        }
+        .unwrap_or_else(|| ColumnWidth::Fixed(window.size().w));
 
         match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => {
@@ -610,6 +616,55 @@ impl<W: LayoutElement> Layout<W> {
                 None
             }
         }
+    }
+
+    /// Adds a new window to the layout on a specific output.
+    pub fn add_window_on_output(
+        &mut self,
+        output: &Output,
+        window: W,
+        width: Option<Option<ColumnWidth>>,
+        is_full_width: bool,
+    ) {
+        let width = match width {
+            Some(Some(width)) => Some(width),
+            Some(None) => None,
+            None => self.options.default_width,
+        }
+        .unwrap_or_else(|| ColumnWidth::Fixed(window.size().w));
+
+        let MonitorSet::Normal {
+            monitors,
+            active_monitor_idx,
+            ..
+        } = &mut self.monitor_set
+        else {
+            panic!()
+        };
+
+        let (mon_idx, mon) = monitors
+            .iter_mut()
+            .enumerate()
+            .find(|(_, mon)| mon.output == *output)
+            .unwrap();
+
+        // Don't steal focus from an active fullscreen window.
+        let mut activate = true;
+        let ws = &mon.workspaces[mon.active_workspace_idx];
+        if mon_idx == *active_monitor_idx
+            && !ws.columns.is_empty()
+            && ws.columns[ws.active_column_idx].is_fullscreen
+        {
+            activate = false;
+        }
+
+        mon.add_window(
+            mon.active_workspace_idx,
+            window,
+            activate,
+            width,
+            is_full_width,
+        );
     }
 
     pub fn remove_window(&mut self, window: &W) {
@@ -2819,11 +2874,24 @@ mod tests {
     }
 
     prop_compose! {
+        fn arbitrary_border()(
+            off in any::<bool>(),
+            width in arbitrary_spacing(),
+        ) -> niri_config::Border {
+            niri_config::Border {
+                off,
+                width,
+                ..Default::default()
+            }
+        }
+    }
+
+    prop_compose! {
         fn arbitrary_options()(
             gaps in arbitrary_spacing(),
             struts in arbitrary_struts(),
             focus_ring in arbitrary_focus_ring(),
-            border in arbitrary_focus_ring(),
+            border in arbitrary_border(),
             center_focused_column in arbitrary_center_focused_column(),
         ) -> Options {
             Options {

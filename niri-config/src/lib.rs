@@ -7,6 +7,7 @@ use std::str::FromStr;
 use bitflags::bitflags;
 use miette::{miette, Context, IntoDiagnostic, NarratableReportHandler};
 use niri_ipc::{LayoutSwitchTarget, SizeChange};
+use regex::Regex;
 use smithay::input::keyboard::keysyms::KEY_NoSymbol;
 use smithay::input::keyboard::xkb::{keysym_from_name, KEYSYM_CASE_INSENSITIVE};
 use smithay::input::keyboard::{Keysym, XkbConfig};
@@ -38,6 +39,8 @@ pub struct Config {
     pub hotkey_overlay: HotkeyOverlay,
     #[knuffel(child, default)]
     pub animations: Animations,
+    #[knuffel(children(name = "window-rule"))]
+    pub window_rules: Vec<WindowRule>,
     #[knuffel(child, default)]
     pub binds: Binds,
     #[knuffel(child, default)]
@@ -53,6 +56,8 @@ pub struct Input {
     pub touchpad: Touchpad,
     #[knuffel(child, default)]
     pub mouse: Mouse,
+    #[knuffel(child, default)]
+    pub trackpoint: Trackpoint,
     #[knuffel(child, default)]
     pub tablet: Tablet,
     #[knuffel(child)]
@@ -140,6 +145,16 @@ pub struct Touchpad {
 
 #[derive(knuffel::Decode, Debug, Default, PartialEq)]
 pub struct Mouse {
+    #[knuffel(child)]
+    pub natural_scroll: bool,
+    #[knuffel(child, unwrap(argument), default)]
+    pub accel_speed: f64,
+    #[knuffel(child, unwrap(argument, str))]
+    pub accel_profile: Option<AccelProfile>,
+}
+
+#[derive(knuffel::Decode, Debug, Default, PartialEq)]
+pub struct Trackpoint {
     #[knuffel(child)]
     pub natural_scroll: bool,
     #[knuffel(child, unwrap(argument), default)]
@@ -277,22 +292,36 @@ pub struct Mode {
     pub refresh: Option<f64>,
 }
 
-#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
+#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
 pub struct Layout {
     #[knuffel(child, default)]
     pub focus_ring: FocusRing,
-    #[knuffel(child, default = default_border())]
-    pub border: FocusRing,
+    #[knuffel(child, default)]
+    pub border: Border,
     #[knuffel(child, unwrap(children), default)]
     pub preset_column_widths: Vec<PresetWidth>,
     #[knuffel(child)]
     pub default_column_width: Option<DefaultColumnWidth>,
     #[knuffel(child, unwrap(argument), default)]
     pub center_focused_column: CenterFocusedColumn,
-    #[knuffel(child, unwrap(argument), default = 16)]
+    #[knuffel(child, unwrap(argument), default = Self::default().gaps)]
     pub gaps: u16,
     #[knuffel(child, default)]
     pub struts: Struts,
+}
+
+impl Default for Layout {
+    fn default() -> Self {
+        Self {
+            focus_ring: Default::default(),
+            border: Default::default(),
+            preset_column_widths: Default::default(),
+            default_column_width: Default::default(),
+            center_focused_column: Default::default(),
+            gaps: 16,
+            struts: Default::default(),
+        }
+    }
 }
 
 #[derive(knuffel::Decode, Debug, Clone, PartialEq, Eq)]
@@ -305,11 +334,11 @@ pub struct SpawnAtStartup {
 pub struct FocusRing {
     #[knuffel(child)]
     pub off: bool,
-    #[knuffel(child, unwrap(argument), default = 4)]
+    #[knuffel(child, unwrap(argument), default = Self::default().width)]
     pub width: u16,
-    #[knuffel(child, default = Color::new(127, 200, 255, 255))]
+    #[knuffel(child, default = Self::default().active_color)]
     pub active_color: Color,
-    #[knuffel(child, default = Color::new(80, 80, 80, 255))]
+    #[knuffel(child, default = Self::default().inactive_color)]
     pub inactive_color: Color,
 }
 
@@ -324,12 +353,37 @@ impl Default for FocusRing {
     }
 }
 
-pub const fn default_border() -> FocusRing {
-    FocusRing {
-        off: true,
-        width: 4,
-        active_color: Color::new(255, 200, 127, 255),
-        inactive_color: Color::new(80, 80, 80, 255),
+#[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq)]
+pub struct Border {
+    #[knuffel(child)]
+    pub off: bool,
+    #[knuffel(child, unwrap(argument), default = Self::default().width)]
+    pub width: u16,
+    #[knuffel(child, default = Self::default().active_color)]
+    pub active_color: Color,
+    #[knuffel(child, default = Self::default().inactive_color)]
+    pub inactive_color: Color,
+}
+
+impl Default for Border {
+    fn default() -> Self {
+        Self {
+            off: true,
+            width: 4,
+            active_color: Color::new(255, 200, 127, 255),
+            inactive_color: Color::new(80, 80, 80, 255),
+        }
+    }
+}
+
+impl From<Border> for FocusRing {
+    fn from(value: Border) -> Self {
+        Self {
+            off: value.off,
+            width: value.width,
+            active_color: value.active_color,
+            inactive_color: value.inactive_color,
+        }
     }
 }
 
@@ -485,6 +539,34 @@ pub enum AnimationCurve {
     EaseOutExpo,
 }
 
+#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
+pub struct WindowRule {
+    #[knuffel(children(name = "match"))]
+    pub matches: Vec<Match>,
+    #[knuffel(children(name = "exclude"))]
+    pub excludes: Vec<Match>,
+
+    #[knuffel(child)]
+    pub default_column_width: Option<DefaultColumnWidth>,
+    #[knuffel(child, unwrap(argument))]
+    pub open_on_output: Option<String>,
+}
+
+#[derive(knuffel::Decode, Debug, Default, Clone)]
+pub struct Match {
+    #[knuffel(property, str)]
+    pub app_id: Option<Regex>,
+    #[knuffel(property, str)]
+    pub title: Option<Regex>,
+}
+
+impl PartialEq for Match {
+    fn eq(&self, other: &Self) -> bool {
+        self.app_id.as_ref().map(Regex::as_str) == other.app_id.as_ref().map(Regex::as_str)
+            && self.title.as_ref().map(Regex::as_str) == other.title.as_ref().map(Regex::as_str)
+    }
+}
+
 #[derive(knuffel::Decode, Debug, Default, PartialEq)]
 pub struct Binds(#[knuffel(children)] pub Vec<Bind>);
 
@@ -516,7 +598,7 @@ bitflags! {
 // Remember to add new actions to the CLI enum too.
 #[derive(knuffel::Decode, Debug, Clone, PartialEq)]
 pub enum Action {
-    Quit,
+    Quit(#[knuffel(property(name = "skip-confirmation"), default)] bool),
     #[knuffel(skip)]
     ChangeVt(i32),
     Suspend,
@@ -592,7 +674,7 @@ pub enum Action {
 impl From<niri_ipc::Action> for Action {
     fn from(value: niri_ipc::Action) -> Self {
         match value {
-            niri_ipc::Action::Quit => Self::Quit,
+            niri_ipc::Action::Quit { skip_confirmation } => Self::Quit(skip_confirmation),
             niri_ipc::Action::PowerOffMonitors => Self::PowerOffMonitors,
             niri_ipc::Action::Spawn { command } => Self::Spawn(command),
             niri_ipc::Action::Screenshot => Self::Screenshot,
@@ -814,13 +896,11 @@ pub fn set_miette_hook() -> Result<(), miette::InstallError> {
 
 #[cfg(test)]
 mod tests {
-    use miette::NarratableReportHandler;
-
     use super::*;
 
     #[track_caller]
     fn check(text: &str, expected: Config) {
-        let _ = miette::set_hook(Box::new(|_| Box::new(NarratableReportHandler::new())));
+        let _ = set_miette_hook();
 
         let parsed = Config::parse("test.kdl", text)
             .map_err(miette::Report::new)
@@ -858,6 +938,12 @@ mod tests {
                     accel-profile "flat"
                 }
 
+                trackpoint {
+                    natural-scroll
+                    accel-speed 0.0
+                    accel-profile "flat"
+                }
+
                 tablet {
                     map-to-output "eDP-1"
                 }
@@ -881,7 +967,6 @@ mod tests {
 
                 border {
                     width 3
-                    active-color 0 100 200 255
                     inactive-color 255 200 100 0
                 }
 
@@ -931,13 +1016,21 @@ mod tests {
                 }
             }
 
+            window-rule {
+                match app-id=".*alacritty"
+                exclude title="~"
+
+                open-on-output "eDP-1"
+            }
+
             binds {
                 Mod+T { spawn "alacritty"; }
                 Mod+Q { close-window; }
                 Mod+Shift+H { focus-monitor-left; }
                 Mod+Ctrl+Shift+L { move-window-to-monitor-right; }
                 Mod+Comma { consume-window-into-column; }
-                Mod+1 { focus-workspace 1;}
+                Mod+1 { focus-workspace 1; }
+                Mod+Shift+E { quit skip-confirmation=true; }
             }
 
             debug {
@@ -968,6 +1061,11 @@ mod tests {
                     mouse: Mouse {
                         natural_scroll: true,
                         accel_speed: 0.4,
+                        accel_profile: Some(AccelProfile::Flat),
+                    },
+                    trackpoint: Trackpoint {
+                        natural_scroll: true,
+                        accel_speed: 0.0,
                         accel_profile: Some(AccelProfile::Flat),
                     },
                     tablet: Tablet {
@@ -1004,13 +1102,13 @@ mod tests {
                             a: 0,
                         },
                     },
-                    border: FocusRing {
+                    border: Border {
                         off: false,
                         width: 3,
                         active_color: Color {
-                            r: 0,
-                            g: 100,
-                            b: 200,
+                            r: 255,
+                            g: 200,
+                            b: 127,
                             a: 255,
                         },
                         inactive_color: Color {
@@ -1063,6 +1161,18 @@ mod tests {
                     },
                     ..Default::default()
                 },
+                window_rules: vec![WindowRule {
+                    matches: vec![Match {
+                        app_id: Some(Regex::new(".*alacritty").unwrap()),
+                        title: None,
+                    }],
+                    excludes: vec![Match {
+                        app_id: None,
+                        title: Some(Regex::new("~").unwrap()),
+                    }],
+                    open_on_output: Some("eDP-1".to_owned()),
+                    ..Default::default()
+                }],
                 binds: Binds(vec![
                     Bind {
                         key: Key {
@@ -1105,6 +1215,13 @@ mod tests {
                             modifiers: Modifiers::COMPOSITOR,
                         },
                         actions: vec![Action::FocusWorkspace(1)],
+                    },
+                    Bind {
+                        key: Key {
+                            keysym: Keysym::e,
+                            modifiers: Modifiers::COMPOSITOR | Modifiers::SHIFT,
+                        },
+                        actions: vec![Action::Quit(true)],
                     },
                 ]),
                 debug: DebugConfig {

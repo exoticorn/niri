@@ -252,6 +252,7 @@ impl State {
 
                 if let Some(dialog) = &this.niri.exit_confirm_dialog {
                     if dialog.is_open() && pressed && raw == Some(Keysym::Return) {
+                        info!("quitting after confirming exit dialog");
                         this.niri.stop_signal.stop();
                     }
                 }
@@ -288,15 +289,18 @@ impl State {
         }
 
         match action {
-            Action::Quit => {
-                if let Some(dialog) = &mut self.niri.exit_confirm_dialog {
-                    if dialog.show() {
-                        self.niri.queue_redraw_all();
+            Action::Quit(skip_confirmation) => {
+                if !skip_confirmation {
+                    if let Some(dialog) = &mut self.niri.exit_confirm_dialog {
+                        if dialog.show() {
+                            self.niri.queue_redraw_all();
+                        }
+                        return;
                     }
-                } else {
-                    info!("quitting because quit bind was pressed");
-                    self.niri.stop_signal.stop()
                 }
+
+                info!("quitting as requested");
+                self.niri.stop_signal.stop()
             }
             Action::ChangeVt(vt) => {
                 self.backend.change_vt(vt);
@@ -593,48 +597,56 @@ impl State {
             Action::MoveWindowToMonitorLeft => {
                 if let Some(output) = self.niri.output_left() {
                     self.niri.layout.move_to_output(&output);
+                    self.niri.layout.focus_output(&output);
                     self.move_cursor_to_output(&output);
                 }
             }
             Action::MoveWindowToMonitorRight => {
                 if let Some(output) = self.niri.output_right() {
                     self.niri.layout.move_to_output(&output);
+                    self.niri.layout.focus_output(&output);
                     self.move_cursor_to_output(&output);
                 }
             }
             Action::MoveWindowToMonitorDown => {
                 if let Some(output) = self.niri.output_down() {
                     self.niri.layout.move_to_output(&output);
+                    self.niri.layout.focus_output(&output);
                     self.move_cursor_to_output(&output);
                 }
             }
             Action::MoveWindowToMonitorUp => {
                 if let Some(output) = self.niri.output_up() {
                     self.niri.layout.move_to_output(&output);
+                    self.niri.layout.focus_output(&output);
                     self.move_cursor_to_output(&output);
                 }
             }
             Action::MoveColumnToMonitorLeft => {
                 if let Some(output) = self.niri.output_left() {
                     self.niri.layout.move_column_to_output(&output);
+                    self.niri.layout.focus_output(&output);
                     self.move_cursor_to_output(&output);
                 }
             }
             Action::MoveColumnToMonitorRight => {
                 if let Some(output) = self.niri.output_right() {
                     self.niri.layout.move_column_to_output(&output);
+                    self.niri.layout.focus_output(&output);
                     self.move_cursor_to_output(&output);
                 }
             }
             Action::MoveColumnToMonitorDown => {
                 if let Some(output) = self.niri.output_down() {
                     self.niri.layout.move_column_to_output(&output);
+                    self.niri.layout.focus_output(&output);
                     self.move_cursor_to_output(&output);
                 }
             }
             Action::MoveColumnToMonitorUp => {
                 if let Some(output) = self.niri.output_up() {
                     self.niri.layout.move_column_to_output(&output);
+                    self.niri.layout.focus_output(&output);
                     self.move_cursor_to_output(&output);
                 }
             }
@@ -1601,9 +1613,9 @@ fn bound_action(
 fn should_activate_monitors<I: InputBackend>(event: &InputEvent<I>) -> bool {
     match event {
         InputEvent::Keyboard { event } if event.state() == KeyState::Pressed => true,
+        InputEvent::PointerButton { event } if event.state() == ButtonState::Pressed => true,
         InputEvent::PointerMotion { .. }
         | InputEvent::PointerMotionAbsolute { .. }
-        | InputEvent::PointerButton { .. }
         | InputEvent::PointerAxis { .. }
         | InputEvent::GestureSwipeBegin { .. }
         | InputEvent::GesturePinchBegin { .. }
@@ -1622,8 +1634,8 @@ fn should_activate_monitors<I: InputBackend>(event: &InputEvent<I>) -> bool {
 fn should_hide_hotkey_overlay<I: InputBackend>(event: &InputEvent<I>) -> bool {
     match event {
         InputEvent::Keyboard { event } if event.state() == KeyState::Pressed => true,
-        InputEvent::PointerButton { .. }
-        | InputEvent::PointerAxis { .. }
+        InputEvent::PointerButton { event } if event.state() == ButtonState::Pressed => true,
+        InputEvent::PointerAxis { .. }
         | InputEvent::GestureSwipeBegin { .. }
         | InputEvent::GesturePinchBegin { .. }
         | InputEvent::TouchDown { .. }
@@ -1637,8 +1649,8 @@ fn should_hide_hotkey_overlay<I: InputBackend>(event: &InputEvent<I>) -> bool {
 fn should_hide_exit_confirm_dialog<I: InputBackend>(event: &InputEvent<I>) -> bool {
     match event {
         InputEvent::Keyboard { event } if event.state() == KeyState::Pressed => true,
-        InputEvent::PointerButton { .. }
-        | InputEvent::PointerAxis { .. }
+        InputEvent::PointerButton { event } if event.state() == ButtonState::Pressed => true,
+        InputEvent::PointerAxis { .. }
         | InputEvent::GestureSwipeBegin { .. }
         | InputEvent::GesturePinchBegin { .. }
         | InputEvent::TouchDown { .. }
@@ -1659,7 +1671,7 @@ fn should_notify_activity<I: InputBackend>(event: &InputEvent<I>) -> bool {
 fn allowed_when_locked(action: &Action) -> bool {
     matches!(
         action,
-        Action::Quit
+        Action::Quit(_)
             | Action::ChangeVt(_)
             | Action::Suspend
             | Action::PowerOffMonitors
@@ -1670,7 +1682,7 @@ fn allowed_when_locked(action: &Action) -> bool {
 fn allowed_during_screenshot(action: &Action) -> bool {
     matches!(
         action,
-        Action::Quit | Action::ChangeVt(_) | Action::Suspend | Action::PowerOffMonitors
+        Action::Quit(_) | Action::ChangeVt(_) | Action::Suspend | Action::PowerOffMonitors
     )
 }
 
@@ -1719,6 +1731,18 @@ pub fn apply_libinput_settings(config: &niri_config::Input, device: &mut input::
         && !is_trackpoint;
     if is_mouse {
         let c = &config.mouse;
+        let _ = device.config_scroll_set_natural_scroll_enabled(c.natural_scroll);
+        let _ = device.config_accel_set_speed(c.accel_speed);
+
+        if let Some(accel_profile) = c.accel_profile {
+            let _ = device.config_accel_set_profile(accel_profile.into());
+        } else if let Some(default) = device.config_accel_default_profile() {
+            let _ = device.config_accel_set_profile(default);
+        }
+    }
+
+    if is_trackpoint {
+        let c = &config.trackpoint;
         let _ = device.config_scroll_set_natural_scroll_enabled(c.natural_scroll);
         let _ = device.config_accel_set_speed(c.accel_speed);
 

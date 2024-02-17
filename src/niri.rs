@@ -44,6 +44,7 @@ use smithay::reexports::calloop::{
     self, Idle, Interest, LoopHandle, LoopSignal, Mode, PostAction, RegistrationToken,
 };
 use smithay::reexports::input;
+use smithay::reexports::wayland_protocols::ext::session_lock::v1::server::ext_session_lock_v1::ExtSessionLockV1;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::WmCapabilities;
 use smithay::reexports::wayland_protocols_misc::server_decoration as _server_decoration;
 use smithay::reexports::wayland_server::backend::{
@@ -264,7 +265,7 @@ pub enum LockState {
     #[default]
     Unlocked,
     Locking(SessionLocker),
-    Locked,
+    Locked(ExtSessionLockV1),
 }
 
 #[derive(PartialEq, Eq)]
@@ -629,6 +630,7 @@ impl State {
 
         if config.input.touchpad != old_config.input.touchpad
             || config.input.mouse != old_config.input.mouse
+            || config.input.trackpoint != old_config.input.trackpoint
         {
             libinput_config_changed = true;
         }
@@ -1301,8 +1303,9 @@ impl Niri {
                     .all(|state| state.lock_render_state == LockRenderState::Locked);
 
                 if all_locked {
+                    let lock = confirmation.ext_session_lock().clone();
                     confirmation.lock();
-                    self.lock_state = LockState::Locked;
+                    self.lock_state = LockState::Locked(lock);
                 } else {
                     // Still waiting.
                     self.lock_state = LockState::Locking(confirmation);
@@ -2113,8 +2116,9 @@ impl Niri {
                         .all(|state| state.lock_render_state == LockRenderState::Locked);
 
                     if all_locked {
+                        let lock = confirmation.ext_session_lock().clone();
                         confirmation.lock();
-                        self.lock_state = LockState::Locked;
+                        self.lock_state = LockState::Locked(lock);
                     } else {
                         // Still waiting.
                         self.lock_state = LockState::Locking(confirmation);
@@ -2838,6 +2842,22 @@ impl Niri {
     }
 
     pub fn lock(&mut self, confirmation: SessionLocker) {
+        // Check if another client is in the process of locking.
+        if matches!(self.lock_state, LockState::Locking(_)) {
+            info!("refusing lock as another client is currently locking");
+            return;
+        }
+
+        // Check if we're already locked with an active client.
+        if let LockState::Locked(lock) = &self.lock_state {
+            if lock.is_alive() {
+                info!("refusing lock as already locked with an active client");
+                return;
+            }
+
+            // If the client had died, continue with the new lock.
+        }
+
         info!("locking session");
 
         self.screenshot_ui.close();

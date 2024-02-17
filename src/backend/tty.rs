@@ -41,6 +41,9 @@ use smithay::reexports::wayland_protocols;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::DeviceFd;
 use smithay::wayland::dmabuf::{DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal};
+use smithay::wayland::drm_lease::{
+    DrmLease, DrmLeaseBuilder, DrmLeaseRequest, DrmLeaseState, LeaseRejected,
+};
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 use smithay_drm_extras::edid::EdidInfo;
 use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1::TrancheFlags;
@@ -105,7 +108,7 @@ type GbmDrmCompositor = DrmCompositor<
     DrmDeviceFd,
 >;
 
-struct OutputDevice {
+pub struct OutputDevice {
     token: RegistrationToken,
     render_node: DrmNode,
     drm_scanner: DrmScanner,
@@ -114,6 +117,42 @@ struct OutputDevice {
     // See https://github.com/Smithay/smithay/issues/1102.
     drm: DrmDevice,
     gbm: GbmDevice<DrmDeviceFd>,
+
+    pub drm_lease_state: DrmLeaseState,
+    non_desktop_connectors: HashSet<(connector::Handle, crtc::Handle)>,
+    active_leases: Vec<DrmLease>,
+}
+
+impl OutputDevice {
+    pub fn lease_request(
+        &self,
+        request: DrmLeaseRequest,
+    ) -> Result<DrmLeaseBuilder, LeaseRejected> {
+        let mut builder = DrmLeaseBuilder::new(&self.drm);
+        for connector in request.connectors {
+            let (_, crtc) = self
+                .non_desktop_connectors
+                .iter()
+                .find(|(conn, _)| connector == *conn)
+                .ok_or_else(|| {
+                    warn!("Attempted to lease connector that is not non-desktop");
+                    LeaseRejected::default()
+                })?;
+            builder.add_connector(connector);
+            builder.add_crtc(*crtc);
+            let planes = self.drm.planes(crtc).map_err(LeaseRejected::with_cause)?;
+            builder.add_plane(planes.primary.handle);
+        }
+        Ok(builder)
+    }
+
+    pub fn new_lease(&mut self, lease: DrmLease) {
+        self.active_leases.push(lease);
+    }
+
+    pub fn remove_lease(&mut self, lease_id: u32) {
+        self.active_leases.retain(|l| l.id() != lease_id);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -359,6 +398,9 @@ impl Tty {
 
                 self.refresh_ipc_outputs();
 
+                niri.idle_notifier_state.notify_activity(&niri.seat);
+                niri.monitors_active = true;
+                self.set_monitors_active(true);
                 niri.queue_redraw_all();
             }
         }
@@ -373,6 +415,8 @@ impl Tty {
         debug!("device added: {device_id} {path:?}");
 
         let node = DrmNode::from_dev_id(device_id)?;
+        let drm_lease_state = DrmLeaseState::new::<State>(&niri.display_handle, &node)
+            .context("Couldn't create DrmLeaseState")?;
 
         let open_flags = OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK;
         let fd = self.session.open(path, open_flags)?;
@@ -462,6 +506,9 @@ impl Tty {
             gbm,
             drm_scanner: DrmScanner::new(),
             surfaces: HashMap::new(),
+            drm_lease_state,
+            active_leases: Vec::new(),
+            non_desktop_connectors: HashSet::new(),
         };
         assert!(self.devices.insert(node, device).is_none());
 
@@ -583,6 +630,41 @@ impl Tty {
         );
         debug!("connecting connector: {output_name}");
 
+        let device = self.devices.get_mut(&node).context("missing device")?;
+
+        let non_desktop = device
+            .drm
+            .get_properties(connector.handle())
+            .ok()
+            .and_then(|props| {
+                let (info, value) = props
+                    .into_iter()
+                    .filter_map(|(handle, value)| {
+                        let info = device.drm.get_property(handle).ok()?;
+                        Some((info, value))
+                    })
+                    .find(|(info, _)| info.name().to_str() == Ok("non-desktop"))?;
+
+                info.value_type().convert_value(value).as_boolean()
+            })
+            .unwrap_or(false);
+
+        if non_desktop {
+            debug!("output is non desktop");
+            let description = EdidInfo::for_connector(&device.drm, connector.handle())
+                .map(|info| truncate_to_nul(info.model))
+                .unwrap_or_else(|| "Unknown".into());
+            device.drm_lease_state.add_connector::<State>(
+                connector.handle(),
+                output_name,
+                description,
+            );
+            device
+                .non_desktop_connectors
+                .insert((connector.handle(), crtc));
+            return Ok(());
+        }
+
         let config = self
             .config
             .borrow()
@@ -596,8 +678,6 @@ impl Tty {
             debug!("output is disabled in the config");
             return Ok(());
         }
-
-        let device = self.devices.get_mut(&node).context("missing device")?;
 
         for m in connector.modes() {
             trace!("{m:?}");
@@ -632,7 +712,12 @@ impl Tty {
         let (physical_width, physical_height) = connector.size().unwrap_or((0, 0));
 
         let (make, model) = EdidInfo::for_connector(&device.drm, connector.handle())
-            .map(|info| (info.manufacturer, info.model))
+            .map(|info| {
+                (
+                    truncate_to_nul(info.manufacturer),
+                    truncate_to_nul(info.model),
+                )
+            })
             .unwrap_or_else(|| ("Unknown".into(), "Unknown".into()));
 
         let output = Output::new(
@@ -1159,36 +1244,54 @@ impl Tty {
                 let physical_size = connector.size();
 
                 let (make, model) = EdidInfo::for_connector(&device.drm, connector.handle())
-                    .map(|info| (info.manufacturer, info.model))
+                    .map(|info| {
+                        (
+                            truncate_to_nul(info.manufacturer),
+                            truncate_to_nul(info.model),
+                        )
+                    })
                     .unwrap_or_else(|| ("Unknown".into(), "Unknown".into()));
+
+                let surface = device.surfaces.get(&crtc);
+                let current_crtc_mode = surface.map(|surface| surface.compositor.pending_mode());
+                let mut current_mode = None;
 
                 let modes = connector
                     .modes()
                     .iter()
-                    .map(|m| niri_ipc::Mode {
-                        width: m.size().0,
-                        height: m.size().1,
-                        refresh_rate: Mode::from(*m).refresh as u32,
+                    .filter(|m| !m.flags().contains(ModeFlags::INTERLACE))
+                    .enumerate()
+                    .map(|(idx, m)| {
+                        if Some(*m) == current_crtc_mode {
+                            current_mode = Some(idx);
+                        }
+
+                        niri_ipc::Mode {
+                            width: m.size().0,
+                            height: m.size().1,
+                            refresh_rate: Mode::from(*m).refresh as u32,
+                        }
                     })
                     .collect();
 
-                let mut output = niri_ipc::Output {
+                if let Some(crtc_mode) = current_crtc_mode {
+                    if current_mode.is_none() {
+                        if crtc_mode.flags().contains(ModeFlags::INTERLACE) {
+                            warn!("connector mode list missing current mode (interlaced)");
+                        } else {
+                            error!("connector mode list missing current mode");
+                        }
+                    }
+                }
+
+                let output = niri_ipc::Output {
                     name: connector_name.clone(),
                     make,
                     model,
                     physical_size,
                     modes,
-                    current_mode: None,
+                    current_mode,
                 };
-
-                if let Some(surface) = device.surfaces.get(&crtc) {
-                    let current = surface.compositor.pending_mode();
-                    if let Some(current) = connector.modes().iter().position(|m| *m == current) {
-                        output.current_mode = Some(current);
-                    } else {
-                        error!("connector mode list missing current mode");
-                    }
-                }
 
                 ipc_outputs.insert(connector_name, output);
             }
@@ -1369,6 +1472,10 @@ impl Tty {
         }
 
         self.refresh_ipc_outputs();
+    }
+
+    pub fn get_device_from_node(&mut self, node: DrmNode) -> Option<&mut OutputDevice> {
+        self.devices.get_mut(&node)
     }
 }
 
@@ -1568,6 +1675,11 @@ fn pick_mode(
                 continue;
             }
 
+            // Interlaced modes don't appear to work.
+            if m.flags().contains(ModeFlags::INTERLACE) {
+                continue;
+            }
+
             if let Some(refresh) = refresh {
                 // If refresh is set, only pick modes with matching refresh.
                 let wl_mode = Mode::from(*m);
@@ -1612,4 +1724,32 @@ fn pick_mode(
     }
 
     mode.map(|m| (*m, fallback))
+}
+
+fn truncate_to_nul(mut s: String) -> String {
+    if let Some(index) = s.find('\0') {
+        s.truncate(index);
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[track_caller]
+    fn check(input: &str, expected: &str) {
+        let input = String::from(input);
+        assert_eq!(truncate_to_nul(input), expected);
+    }
+
+    #[test]
+    fn truncate_to_nul_works() {
+        check("", "");
+        check("qwer", "qwer");
+        check("abc\0def", "abc");
+        check("\0as", "");
+        check("a\0\0\0b", "a");
+        check("bb😁\0cc", "bb😁");
+    }
 }
