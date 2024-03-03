@@ -902,6 +902,11 @@ impl Tty {
                 Duration::ZERO
             }
         };
+        let presentation_time = if niri.config.borrow().debug.emulate_zero_presentation_time {
+            Duration::ZERO
+        } else {
+            presentation_time
+        };
 
         let message = if presentation_time.is_zero() {
             format!("vblank on {name}, presentation time unknown")
@@ -951,16 +956,17 @@ impl Tty {
                     .unwrap_or(Duration::ZERO);
                 // FIXME: ideally should be monotonically increasing for a surface.
                 let seq = meta.sequence as u64;
-                let flags = wp_presentation_feedback::Kind::Vsync
-                    | wp_presentation_feedback::Kind::HwClock
+                let mut flags = wp_presentation_feedback::Kind::Vsync
                     | wp_presentation_feedback::Kind::HwCompletion;
 
-                feedback.presented::<_, smithay::utils::Monotonic>(
-                    presentation_time,
-                    refresh,
-                    seq,
-                    flags,
-                );
+                let time = if presentation_time.is_zero() {
+                    now
+                } else {
+                    flags.insert(wp_presentation_feedback::Kind::HwClock);
+                    presentation_time
+                };
+
+                feedback.presented::<_, smithay::utils::Monotonic>(time, refresh, seq, flags);
 
                 if !presentation_time.is_zero() {
                     let misprediction_s =
@@ -977,15 +983,15 @@ impl Tty {
             }
         }
 
-        if let Some(last_sequence) = output_state.current_estimated_sequence {
+        if let Some(last_sequence) = output_state.last_drm_sequence {
             let delta = meta.sequence as f64 - last_sequence as f64;
             tracy_client::Client::running()
                 .unwrap()
                 .plot(surface.sequence_delta_plot_name, delta);
         }
+        output_state.last_drm_sequence = Some(meta.sequence);
 
         output_state.frame_clock.presented(presentation_time);
-        output_state.current_estimated_sequence = Some(meta.sequence);
 
         let redraw_needed = match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
             RedrawState::Idle => unreachable!(),
@@ -1018,6 +1024,9 @@ impl Tty {
             return;
         };
 
+        // We waited for the timer, now we can send frame callbacks again.
+        output_state.frame_callback_sequence = output_state.frame_callback_sequence.wrapping_add(1);
+
         match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
             RedrawState::Idle => unreachable!(),
             RedrawState::Queued(_) => unreachable!(),
@@ -1030,14 +1039,10 @@ impl Tty {
             }
         }
 
-        if let Some(sequence) = output_state.current_estimated_sequence.as_mut() {
-            *sequence = sequence.wrapping_add(1);
-
-            if output_state.unfinished_animations_remain {
-                niri.queue_redraw(output);
-            } else {
-                niri.send_frame_callbacks(&output);
-            }
+        if output_state.unfinished_animations_remain {
+            niri.queue_redraw(output);
+        } else {
+            niri.send_frame_callbacks(&output);
         }
     }
 
@@ -1140,6 +1145,12 @@ impl Tty {
                                     niri.event_loop.remove(token);
                                 }
                             };
+
+                            // We queued this frame successfully, so the current client buffers were
+                            // latched. We can send frame callbacks now, since a new client commit
+                            // will no longer overwrite this frame and will wait for a VBlank.
+                            output_state.frame_callback_sequence =
+                                output_state.frame_callback_sequence.wrapping_add(1);
 
                             return RenderResult::Submitted;
                         }
@@ -1643,7 +1654,22 @@ fn queue_estimated_vblank_timer(
     }
 
     let now = get_monotonic_time();
-    let timer = Timer::from_duration(target_presentation_time.saturating_sub(now));
+    let mut duration = target_presentation_time.saturating_sub(now);
+
+    // No use setting a zero timer, since we'll send frame callbacks anyway right after the call to
+    // render(). This can happen for example with unknown presentation time from DRM.
+    if duration.is_zero() {
+        duration += output_state
+            .frame_clock
+            .refresh_interval()
+            // Unknown refresh interval, i.e. winit backend. Would be good to estimate it somehow
+            // but it's not that important for this code path.
+            .unwrap_or(Duration::from_micros(16_667));
+    }
+
+    trace!("queueing estimated vblank timer to fire in {duration:?}");
+
+    let timer = Timer::from_duration(duration);
     let token = niri
         .event_loop
         .insert_source(timer, move |_, _, data| {

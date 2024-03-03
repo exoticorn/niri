@@ -49,10 +49,9 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::compositor::{send_surface_state, with_states};
 use smithay::wayland::shell::xdg::SurfaceCachedState;
 
+use self::monitor::Monitor;
 pub use self::monitor::MonitorRenderElement;
-use self::monitor::{Monitor, WorkspaceSwitch, WorkspaceSwitchGesture};
 use self::workspace::{compute_working_area, Column, ColumnWidth, OutputId, Workspace};
-use crate::animation::Animation;
 use crate::niri::WindowOffscreenId;
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
@@ -201,7 +200,7 @@ impl Options {
         let default_width = layout
             .default_column_width
             .as_ref()
-            .map(|w| w.0.first().copied().map(ColumnWidth::from))
+            .map(|w| w.0.map(ColumnWidth::from))
             .unwrap_or(Some(ColumnWidth::Proportion(0.5)));
 
         Self {
@@ -1222,6 +1221,8 @@ impl<W: LayoutElement> Layout<W> {
 
     #[cfg(test)]
     fn verify_invariants(&self) {
+        use crate::layout::monitor::WorkspaceSwitch;
+
         let (monitors, &primary_idx, &active_monitor_idx) = match &self.monitor_set {
             MonitorSet::Normal {
                 monitors,
@@ -1594,48 +1595,31 @@ impl<W: LayoutElement> Layout<W> {
         for monitor in monitors {
             // Cancel the gesture on other outputs.
             if &monitor.output != output {
-                if let Some(WorkspaceSwitch::Gesture(_)) = monitor.workspace_switch {
-                    monitor.workspace_switch = None;
-                }
+                monitor.workspace_switch_gesture_end(true);
                 continue;
             }
 
-            let center_idx = monitor.active_workspace_idx;
-            let current_idx = monitor
-                .workspace_switch
-                .as_ref()
-                .map(|s| s.current_idx())
-                .unwrap_or(center_idx as f64);
-
-            let gesture = WorkspaceSwitchGesture {
-                center_idx,
-                current_idx,
-            };
-            monitor.workspace_switch = Some(WorkspaceSwitch::Gesture(gesture));
+            monitor.workspace_switch_gesture_begin();
         }
     }
 
-    pub fn workspace_switch_gesture_update(&mut self, delta_y: f64) -> Option<Option<Output>> {
+    pub fn workspace_switch_gesture_update(
+        &mut self,
+        delta_y: f64,
+        timestamp: Duration,
+    ) -> Option<Option<Output>> {
         let monitors = match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => monitors,
             MonitorSet::NoOutputs { .. } => return None,
         };
 
         for monitor in monitors {
-            if let Some(WorkspaceSwitch::Gesture(gesture)) = &mut monitor.workspace_switch {
-                // Normalize like GNOME Shell's workspace switching.
-                let delta_y = delta_y / 400.;
-
-                let min = gesture.center_idx.saturating_sub(1) as f64;
-                let max = (gesture.center_idx + 1).min(monitor.workspaces.len() - 1) as f64;
-                let new_idx = (gesture.current_idx + delta_y).clamp(min, max);
-
-                if gesture.current_idx == new_idx {
+            if let Some(refresh) = monitor.workspace_switch_gesture_update(delta_y, timestamp) {
+                if refresh {
+                    return Some(Some(monitor.output.clone()));
+                } else {
                     return Some(None);
                 }
-
-                gesture.current_idx = new_idx;
-                return Some(Some(monitor.output.clone()));
             }
         }
 
@@ -1649,26 +1633,69 @@ impl<W: LayoutElement> Layout<W> {
         };
 
         for monitor in monitors {
-            if let Some(WorkspaceSwitch::Gesture(gesture)) = &mut monitor.workspace_switch {
-                if cancelled {
-                    monitor.workspace_switch = None;
-                    return Some(monitor.output.clone());
+            if monitor.workspace_switch_gesture_end(cancelled) {
+                return Some(monitor.output.clone());
+            }
+        }
+
+        None
+    }
+
+    pub fn view_offset_gesture_begin(&mut self, output: &Output) {
+        let monitors = match &mut self.monitor_set {
+            MonitorSet::Normal { monitors, .. } => monitors,
+            MonitorSet::NoOutputs { .. } => unreachable!(),
+        };
+
+        for monitor in monitors {
+            for (idx, ws) in monitor.workspaces.iter_mut().enumerate() {
+                // Cancel the gesture on other workspaces.
+                if &monitor.output != output || idx != monitor.active_workspace_idx {
+                    ws.view_offset_gesture_end(true);
+                    continue;
                 }
 
-                // FIXME: keep track of gesture velocity and use it to compute the final point and
-                // to animate to it.
-                let current_idx = gesture.current_idx;
-                let idx = current_idx.round() as usize;
+                ws.view_offset_gesture_begin();
+            }
+        }
+    }
 
-                monitor.active_workspace_idx = idx;
-                monitor.workspace_switch = Some(WorkspaceSwitch::Animation(Animation::new(
-                    current_idx,
-                    idx as f64,
-                    self.options.animations.workspace_switch,
-                    niri_config::Animation::default_workspace_switch(),
-                )));
+    pub fn view_offset_gesture_update(
+        &mut self,
+        delta_x: f64,
+        timestamp: Duration,
+    ) -> Option<Option<Output>> {
+        let monitors = match &mut self.monitor_set {
+            MonitorSet::Normal { monitors, .. } => monitors,
+            MonitorSet::NoOutputs { .. } => return None,
+        };
 
-                return Some(monitor.output.clone());
+        for monitor in monitors {
+            for ws in &mut monitor.workspaces {
+                if let Some(refresh) = ws.view_offset_gesture_update(delta_x, timestamp) {
+                    if refresh {
+                        return Some(Some(monitor.output.clone()));
+                    } else {
+                        return Some(None);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    pub fn view_offset_gesture_end(&mut self, cancelled: bool) -> Option<Output> {
+        let monitors = match &mut self.monitor_set {
+            MonitorSet::Normal { monitors, .. } => monitors,
+            MonitorSet::NoOutputs { .. } => return None,
+        };
+
+        for monitor in monitors {
+            for ws in &mut monitor.workspaces {
+                if ws.view_offset_gesture_end(cancelled) {
+                    return Some(monitor.output.clone());
+                }
             }
         }
 
@@ -1724,25 +1751,31 @@ impl<W: LayoutElement> Layout<W> {
 }
 
 impl Layout<Window> {
-    pub fn refresh(&self) {
+    pub fn refresh(&mut self) {
         let _span = tracy_client::span!("MonitorSet::refresh");
 
-        match &self.monitor_set {
+        match &mut self.monitor_set {
             MonitorSet::Normal {
                 monitors,
                 active_monitor_idx,
                 ..
             } => {
-                for (idx, mon) in monitors.iter().enumerate() {
+                for (idx, mon) in monitors.iter_mut().enumerate() {
                     let is_active = idx == *active_monitor_idx;
-                    for ws in &mon.workspaces {
+                    for (ws_idx, ws) in mon.workspaces.iter_mut().enumerate() {
                         ws.refresh(is_active);
+
+                        // Cancel the view offset gesture after workspace switches, moves, etc.
+                        if ws_idx != mon.active_workspace_idx {
+                            ws.view_offset_gesture_end(false);
+                        }
                     }
                 }
             }
             MonitorSet::NoOutputs { workspaces, .. } => {
                 for ws in workspaces {
                     ws.refresh(false);
+                    ws.view_offset_gesture_end(false);
                 }
             }
         }
@@ -1931,6 +1964,10 @@ mod tests {
         })
     }
 
+    fn arbitrary_view_offset_gesture_delta() -> impl Strategy<Value = f64> {
+        prop_oneof![(-10f64..10f64), (-50000f64..50000f64),]
+    }
+
     #[derive(Debug, Clone, Copy, Arbitrary)]
     enum Op {
         AddOutput(#[proptest(strategy = "1..=5usize")] usize),
@@ -1996,6 +2033,28 @@ mod tests {
         SetWindowHeight(#[proptest(strategy = "arbitrary_size_change()")] SizeChange),
         Communicate(#[proptest(strategy = "1..=5usize")] usize),
         MoveWorkspaceToOutput(#[proptest(strategy = "1..=5u8")] u8),
+        ViewOffsetGestureBegin {
+            #[proptest(strategy = "1..=5usize")]
+            output_idx: usize,
+        },
+        ViewOffsetGestureUpdate {
+            #[proptest(strategy = "arbitrary_view_offset_gesture_delta()")]
+            delta: f64,
+            timestamp: Duration,
+        },
+        ViewOffsetGestureEnd,
+        WorkspaceSwitchGestureBegin {
+            #[proptest(strategy = "1..=5usize")]
+            output_idx: usize,
+        },
+        WorkspaceSwitchGestureUpdate {
+            #[proptest(strategy = "-400f64..400f64")]
+            delta: f64,
+            timestamp: Duration,
+        },
+        WorkspaceSwitchGestureEnd {
+            cancelled: bool,
+        },
     }
 
     impl Op {
@@ -2230,6 +2289,35 @@ mod tests {
                     };
 
                     layout.move_workspace_to_output(&output);
+                }
+                Op::ViewOffsetGestureBegin { output_idx: id } => {
+                    let name = format!("output{id}");
+                    let Some(output) = layout.outputs().find(|o| o.name() == name).cloned() else {
+                        return;
+                    };
+
+                    layout.view_offset_gesture_begin(&output);
+                }
+                Op::ViewOffsetGestureUpdate { delta, timestamp } => {
+                    layout.view_offset_gesture_update(delta, timestamp);
+                }
+                Op::ViewOffsetGestureEnd => {
+                    // We don't handle cancels in this gesture.
+                    layout.view_offset_gesture_end(false);
+                }
+                Op::WorkspaceSwitchGestureBegin { output_idx: id } => {
+                    let name = format!("output{id}");
+                    let Some(output) = layout.outputs().find(|o| o.name() == name).cloned() else {
+                        return;
+                    };
+
+                    layout.workspace_switch_gesture_begin(&output);
+                }
+                Op::WorkspaceSwitchGestureUpdate { delta, timestamp } => {
+                    layout.workspace_switch_gesture_update(delta, timestamp);
+                }
+                Op::WorkspaceSwitchGestureEnd { cancelled } => {
+                    layout.workspace_switch_gesture_end(cancelled);
                 }
             }
         }

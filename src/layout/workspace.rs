@@ -17,7 +17,11 @@ use super::{LayoutElement, Options};
 use crate::animation::Animation;
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
+use crate::swipe_tracker::SwipeTracker;
 use crate::utils::output_size;
+
+/// Amount of touchpad movement to scroll the view for the width of one working area.
+const VIEW_GESTURE_WORKING_AREA_MOVEMENT: f64 = 1200.;
 
 #[derive(Debug)]
 pub struct Workspace<W: LayoutElement> {
@@ -55,8 +59,8 @@ pub struct Workspace<W: LayoutElement> {
     /// for natural handling of fullscreen windows, which must ignore work area padding.
     view_offset: i32,
 
-    /// Animation of the view offset, if one is currently ongoing.
-    view_offset_anim: Option<Animation>,
+    /// Adjustment of the view offset, if one is currently ongoing.
+    view_offset_adj: Option<ViewOffsetAdjustment>,
 
     /// Whether to activate the previous, rather than the next, column upon column removal.
     ///
@@ -79,6 +83,19 @@ niri_render_elements! {
     WorkspaceRenderElement<R> => {
         Tile = TileRenderElement<R>,
     }
+}
+
+#[derive(Debug)]
+enum ViewOffsetAdjustment {
+    Animation(Animation),
+    Gesture(ViewGesture),
+}
+
+#[derive(Debug)]
+struct ViewGesture {
+    current_view_offset: f64,
+    tracker: SwipeTracker,
+    delta_from_tracker: f64,
 }
 
 /// Width of a column.
@@ -192,7 +209,7 @@ impl<W: LayoutElement> Workspace<W> {
             columns: vec![],
             active_column_idx: 0,
             view_offset: 0,
-            view_offset_anim: None,
+            view_offset_adj: None,
             activate_prev_column_on_removal: false,
             options,
         }
@@ -207,22 +224,21 @@ impl<W: LayoutElement> Workspace<W> {
             columns: vec![],
             active_column_idx: 0,
             view_offset: 0,
-            view_offset_anim: None,
+            view_offset_adj: None,
             activate_prev_column_on_removal: false,
             options,
         }
     }
 
     pub fn advance_animations(&mut self, current_time: Duration, is_active: bool) {
-        match &mut self.view_offset_anim {
-            Some(anim) => {
-                anim.set_current_time(current_time);
-                self.view_offset = anim.value().round() as i32;
-                if anim.is_done() {
-                    self.view_offset_anim = None;
-                }
+        if let Some(ViewOffsetAdjustment::Animation(anim)) = &mut self.view_offset_adj {
+            anim.set_current_time(current_time);
+            self.view_offset = anim.value().round() as i32;
+            if anim.is_done() {
+                self.view_offset_adj = None;
             }
-            None => (),
+        } else if let Some(ViewOffsetAdjustment::Gesture(gesture)) = &self.view_offset_adj {
+            self.view_offset = gesture.current_view_offset.round() as i32;
         }
 
         for (col_idx, col) in self.columns.iter_mut().enumerate() {
@@ -232,7 +248,7 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
-        self.view_offset_anim.is_some() || self.columns.iter().any(Column::are_animations_ongoing)
+        self.view_offset_adj.is_some() || self.columns.iter().any(Column::are_animations_ongoing)
     }
 
     pub fn update_config(&mut self, options: Rc<Options>) {
@@ -382,7 +398,7 @@ impl<W: LayoutElement> Workspace<W> {
 
         let new_col_x = self.column_x(idx);
 
-        let final_x = if let Some(anim) = &self.view_offset_anim {
+        let final_x = if let Some(ViewOffsetAdjustment::Animation(anim)) = &self.view_offset_adj {
             current_x - self.view_offset + anim.to().round() as i32
         } else {
             current_x
@@ -406,7 +422,7 @@ impl<W: LayoutElement> Workspace<W> {
         self.view_offset = from_view_offset;
 
         // If we're already animating towards that, don't restart it.
-        if let Some(anim) = &self.view_offset_anim {
+        if let Some(ViewOffsetAdjustment::Animation(anim)) = &self.view_offset_adj {
             if anim.value().round() as i32 == self.view_offset
                 && anim.to().round() as i32 == new_view_offset
             {
@@ -416,19 +432,19 @@ impl<W: LayoutElement> Workspace<W> {
 
         // If our view offset is already this, we don't need to do anything.
         if self.view_offset == new_view_offset {
-            self.view_offset_anim = None;
+            self.view_offset_adj = None;
             return;
         }
 
-        self.view_offset_anim = Some(Animation::new(
+        self.view_offset_adj = Some(ViewOffsetAdjustment::Animation(Animation::new(
             self.view_offset as f64,
             new_view_offset as f64,
             self.options.animations.horizontal_view_movement,
             niri_config::Animation::default_horizontal_view_movement(),
-        ));
+        )));
     }
 
-    fn animate_view_offset_to_column(&mut self, current_x: i32, idx: usize) {
+    fn animate_view_offset_to_column_fit(&mut self, current_x: i32, idx: usize) {
         let new_view_offset = self.compute_new_view_offset_for_column(current_x, idx);
         self.animate_view_offset(current_x, idx, new_view_offset);
     }
@@ -440,7 +456,7 @@ impl<W: LayoutElement> Workspace<W> {
 
         let col = &self.columns[idx];
         if col.is_fullscreen {
-            self.animate_view_offset_to_column(current_x, idx);
+            self.animate_view_offset_to_column_fit(current_x, idx);
             return;
         }
 
@@ -450,7 +466,7 @@ impl<W: LayoutElement> Workspace<W> {
         // edge alignment by the usual positioning code, so there's no use in trying to center it
         // here.
         if self.working_area.size.w <= width {
-            self.animate_view_offset_to_column(current_x, idx);
+            self.animate_view_offset_to_column_fit(current_x, idx);
             return;
         }
 
@@ -459,19 +475,24 @@ impl<W: LayoutElement> Workspace<W> {
         self.animate_view_offset(current_x, idx, new_view_offset);
     }
 
-    fn activate_column(&mut self, idx: usize) {
-        if self.active_column_idx == idx {
-            return;
-        }
-
-        let current_x = self.view_pos();
+    fn animate_view_offset_to_column(
+        &mut self,
+        current_x: i32,
+        idx: usize,
+        prev_idx: Option<usize>,
+    ) {
         match self.options.center_focused_column {
             CenterFocusedColumn::Always => {
                 self.animate_view_offset_to_column_centered(current_x, idx)
             }
             CenterFocusedColumn::OnOverflow => {
+                let Some(prev_idx) = prev_idx else {
+                    self.animate_view_offset_to_column_fit(current_x, idx);
+                    return;
+                };
+
                 // Always take the left or right neighbor of the target as the source.
-                let source_idx = if self.active_column_idx > idx {
+                let source_idx = if prev_idx > idx {
                     min(idx + 1, self.columns.len() - 1)
                 } else {
                     idx.saturating_sub(1)
@@ -493,13 +514,22 @@ impl<W: LayoutElement> Workspace<W> {
 
                 // If it fits together, do a normal animation, otherwise center the new column.
                 if total_width <= self.working_area.size.w {
-                    self.animate_view_offset_to_column(current_x, idx);
+                    self.animate_view_offset_to_column_fit(current_x, idx);
                 } else {
                     self.animate_view_offset_to_column_centered(current_x, idx);
                 }
             }
-            CenterFocusedColumn::Never => self.animate_view_offset_to_column(current_x, idx),
+            CenterFocusedColumn::Never => self.animate_view_offset_to_column_fit(current_x, idx),
         };
+    }
+
+    fn activate_column(&mut self, idx: usize) {
+        if self.active_column_idx == idx {
+            return;
+        }
+
+        let current_x = self.view_pos();
+        self.animate_view_offset_to_column(current_x, idx, Some(self.active_column_idx));
 
         self.active_column_idx = idx;
 
@@ -580,7 +610,7 @@ impl<W: LayoutElement> Workspace<W> {
                     // exclusive zones.
                     self.view_offset = self.compute_new_view_offset_for_column(self.column_x(0), 0);
                 }
-                self.view_offset_anim = None;
+                self.view_offset_adj = None;
             }
 
             self.activate_column(idx);
@@ -652,7 +682,7 @@ impl<W: LayoutElement> Workspace<W> {
                     // exclusive zones.
                     self.view_offset = self.compute_new_view_offset_for_column(self.column_x(0), 0);
                 }
-                self.view_offset_anim = None;
+                self.view_offset_adj = None;
             }
 
             self.activate_column(idx);
@@ -762,17 +792,15 @@ impl<W: LayoutElement> Workspace<W> {
         column.update_window(window);
         column.update_tile_sizes();
 
-        if idx == self.active_column_idx {
+        if idx == self.active_column_idx
+            && !matches!(self.view_offset_adj, Some(ViewOffsetAdjustment::Gesture(_)))
+        {
             // We might need to move the view to ensure the resized window is still visible.
             let current_x = self.view_pos();
 
-            if self.options.center_focused_column == CenterFocusedColumn::Always {
-                // FIXME: we will want to skip the animation in some cases here to make
-                // continuously resizing windows not look janky.
-                self.animate_view_offset_to_column_centered(current_x, idx);
-            } else {
-                self.animate_view_offset_to_column(current_x, idx);
-            }
+            // FIXME: we will want to skip the animation in some cases here to make continuously
+            // resizing windows not look janky.
+            self.animate_view_offset_to_column(current_x, idx, None);
         }
     }
 
@@ -1161,7 +1189,7 @@ impl<W: LayoutElement> Workspace<W> {
             return false;
         }
 
-        if self.view_offset_anim.is_some() {
+        if self.view_offset_adj.is_some() {
             return false;
         }
 
@@ -1199,6 +1227,207 @@ impl<W: LayoutElement> Workspace<W> {
         }
 
         rv
+    }
+
+    pub fn view_offset_gesture_begin(&mut self) {
+        if self.columns.is_empty() {
+            return;
+        }
+
+        let gesture = ViewGesture {
+            current_view_offset: self.view_offset as f64,
+            tracker: SwipeTracker::new(),
+            delta_from_tracker: self.view_offset as f64,
+        };
+        self.view_offset_adj = Some(ViewOffsetAdjustment::Gesture(gesture));
+    }
+
+    pub fn view_offset_gesture_update(
+        &mut self,
+        delta_x: f64,
+        timestamp: Duration,
+    ) -> Option<bool> {
+        let Some(ViewOffsetAdjustment::Gesture(gesture)) = &mut self.view_offset_adj else {
+            return None;
+        };
+
+        gesture.tracker.push(delta_x, timestamp);
+
+        let norm_factor = self.working_area.size.w as f64 / VIEW_GESTURE_WORKING_AREA_MOVEMENT;
+        let pos = gesture.tracker.pos() * norm_factor;
+        let view_offset = pos + gesture.delta_from_tracker;
+        gesture.current_view_offset = view_offset;
+
+        Some(true)
+    }
+
+    pub fn view_offset_gesture_end(&mut self, _cancelled: bool) -> bool {
+        let Some(ViewOffsetAdjustment::Gesture(gesture)) = &self.view_offset_adj else {
+            return false;
+        };
+
+        // We do not handle cancelling, just like GNOME Shell doesn't. For this gesture, proper
+        // cancelling would require keeping track of the original active column, and then updating
+        // it in all the right places (adding columns, removing columns, etc.) -- quite a bit of
+        // effort and bug potential.
+
+        let norm_factor = self.working_area.size.w as f64 / VIEW_GESTURE_WORKING_AREA_MOVEMENT;
+        let pos = gesture.tracker.pos() * norm_factor;
+        let current_view_offset = pos + gesture.delta_from_tracker;
+
+        if self.columns.is_empty() {
+            self.view_offset = current_view_offset.round() as i32;
+            self.view_offset_adj = None;
+            return true;
+        }
+
+        // Figure out where the gesture would stop after deceleration.
+        let end_pos = gesture.tracker.projected_end_pos() * norm_factor;
+        let target_view_offset = end_pos + gesture.delta_from_tracker;
+
+        // Compute the snapping points. These are where the view aligns with column boundaries on
+        // either side.
+        struct Snap {
+            // View position relative to x = 0 (the first column).
+            view_pos: i32,
+            // Column to activate for this snapping point.
+            col_idx: usize,
+        }
+
+        let mut snapping_points = Vec::new();
+
+        let left_strut = self.working_area.loc.x;
+        let right_strut = self.view_size.w - self.working_area.size.w - self.working_area.loc.x;
+
+        if self.options.center_focused_column == CenterFocusedColumn::Always {
+            let mut col_x = 0;
+            for (col_idx, col) in self.columns.iter().enumerate() {
+                let col_w = col.width();
+
+                let view_pos = if col.is_fullscreen {
+                    col_x
+                } else if self.working_area.size.w <= col_w {
+                    col_x - left_strut
+                } else {
+                    col_x - (self.working_area.size.w - col_w) / 2 - left_strut
+                };
+                snapping_points.push(Snap { view_pos, col_idx });
+
+                col_x += col_w + self.options.gaps;
+            }
+        } else {
+            let view_width = self.view_size.w;
+            let mut push = |col_idx, left, right| {
+                snapping_points.push(Snap {
+                    view_pos: left,
+                    col_idx,
+                });
+                snapping_points.push(Snap {
+                    view_pos: right - view_width,
+                    col_idx,
+                });
+            };
+
+            let mut col_x = 0;
+            for (col_idx, col) in self.columns.iter().enumerate() {
+                let col_w = col.width();
+
+                // Normal columns align with the working area, but fullscreen columns align with the
+                // view size.
+                if col.is_fullscreen {
+                    let left = col_x;
+                    let right = col_x + col_w;
+                    push(col_idx, left, right);
+                } else {
+                    // Logic from compute_new_view_offset.
+                    let padding =
+                        ((self.working_area.size.w - col_w) / 2).clamp(0, self.options.gaps);
+                    let left = col_x - padding - left_strut;
+                    let right = col_x + col_w + padding + right_strut;
+                    push(col_idx, left, right);
+                }
+
+                col_x += col_w + self.options.gaps;
+            }
+        }
+
+        // Find the closest snapping point.
+        snapping_points.sort_by_key(|snap| snap.view_pos);
+
+        let active_col_x = self.column_x(self.active_column_idx);
+        let target_view_pos = (active_col_x as f64 + target_view_offset).round() as i32;
+        let target_snap = snapping_points
+            .iter()
+            .min_by_key(|snap| snap.view_pos.abs_diff(target_view_pos))
+            .unwrap();
+
+        let mut new_col_idx = target_snap.col_idx;
+
+        if self.options.center_focused_column != CenterFocusedColumn::Always {
+            // Focus the furthest window towards the direction of the gesture.
+            if target_view_offset >= current_view_offset {
+                for col_idx in (new_col_idx + 1)..self.columns.len() {
+                    let col = &self.columns[col_idx];
+                    let col_x = self.column_x(col_idx);
+                    let col_w = col.width();
+
+                    if col.is_fullscreen {
+                        if target_snap.view_pos + self.view_size.w < col_x + col_w {
+                            break;
+                        }
+                    } else {
+                        let padding =
+                            ((self.working_area.size.w - col_w) / 2).clamp(0, self.options.gaps);
+                        if target_snap.view_pos + left_strut + self.working_area.size.w
+                            < col_x + col_w + padding
+                        {
+                            break;
+                        }
+                    }
+
+                    new_col_idx = col_idx;
+                }
+            } else {
+                for col_idx in (0..new_col_idx).rev() {
+                    let col = &self.columns[col_idx];
+                    let col_x = self.column_x(col_idx);
+                    let col_w = col.width();
+
+                    if col.is_fullscreen {
+                        if col_x < target_snap.view_pos {
+                            break;
+                        }
+                    } else {
+                        let padding =
+                            ((self.working_area.size.w - col_w) / 2).clamp(0, self.options.gaps);
+                        if col_x - padding < target_snap.view_pos + left_strut {
+                            break;
+                        }
+                    }
+
+                    new_col_idx = col_idx;
+                }
+            }
+        }
+
+        let new_col_x = self.column_x(new_col_idx);
+        let delta = (active_col_x - new_col_x) as f64;
+        self.view_offset = (current_view_offset + delta).round() as i32;
+        self.active_column_idx = new_col_idx;
+
+        let target_view_offset = target_snap.view_pos - new_col_x;
+
+        self.view_offset_adj = Some(ViewOffsetAdjustment::Animation(Animation::new(
+            current_view_offset + delta,
+            target_view_offset as f64,
+            self.options.animations.horizontal_view_movement,
+            niri_config::Animation::default_horizontal_view_movement(),
+        )));
+
+        // HACK: deal with things like snapping to the right edge of a larger-than-view window.
+        self.animate_view_offset_to_column(self.view_pos(), new_col_idx, None);
+
+        true
     }
 }
 

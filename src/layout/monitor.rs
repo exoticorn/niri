@@ -15,7 +15,11 @@ use super::workspace::{
 use super::{LayoutElement, Options};
 use crate::animation::Animation;
 use crate::render_helpers::renderer::NiriRenderer;
+use crate::swipe_tracker::SwipeTracker;
 use crate::utils::output_size;
+
+/// Amount of touchpad movement to scroll the height of one workspace.
+const WORKSPACE_GESTURE_MOVEMENT: f64 = 300.;
 
 #[derive(Debug)]
 pub struct Monitor<W: LayoutElement> {
@@ -43,6 +47,7 @@ pub struct WorkspaceSwitchGesture {
     pub center_idx: usize,
     /// Current, fractional workspace index.
     pub current_idx: f64,
+    pub tracker: SwipeTracker,
 }
 
 pub type MonitorRenderElement<R> =
@@ -690,5 +695,75 @@ impl<W: LayoutElement> Monitor<W> {
                     .collect()
             }
         }
+    }
+
+    pub fn workspace_switch_gesture_begin(&mut self) {
+        let center_idx = self.active_workspace_idx;
+        let current_idx = self
+            .workspace_switch
+            .as_ref()
+            .map(|s| s.current_idx())
+            .unwrap_or(center_idx as f64);
+
+        let gesture = WorkspaceSwitchGesture {
+            center_idx,
+            current_idx,
+            tracker: SwipeTracker::new(),
+        };
+        self.workspace_switch = Some(WorkspaceSwitch::Gesture(gesture));
+    }
+
+    pub fn workspace_switch_gesture_update(
+        &mut self,
+        delta_y: f64,
+        timestamp: Duration,
+    ) -> Option<bool> {
+        let Some(WorkspaceSwitch::Gesture(gesture)) = &mut self.workspace_switch else {
+            return None;
+        };
+
+        gesture.tracker.push(delta_y, timestamp);
+
+        let pos = gesture.tracker.pos() / WORKSPACE_GESTURE_MOVEMENT;
+
+        let min = gesture.center_idx.saturating_sub(1) as f64;
+        let max = (gesture.center_idx + 1).min(self.workspaces.len() - 1) as f64;
+        let new_idx = (gesture.center_idx as f64 + pos).clamp(min, max);
+
+        if gesture.current_idx == new_idx {
+            return Some(false);
+        }
+
+        gesture.current_idx = new_idx;
+        Some(true)
+    }
+
+    pub fn workspace_switch_gesture_end(&mut self, cancelled: bool) -> bool {
+        let Some(WorkspaceSwitch::Gesture(gesture)) = &mut self.workspace_switch else {
+            return false;
+        };
+
+        if cancelled {
+            self.workspace_switch = None;
+            self.clean_up_workspaces();
+            return true;
+        }
+
+        let pos = gesture.tracker.projected_end_pos() / WORKSPACE_GESTURE_MOVEMENT;
+
+        let min = gesture.center_idx.saturating_sub(1) as f64;
+        let max = (gesture.center_idx + 1).min(self.workspaces.len() - 1) as f64;
+        let new_idx = (gesture.center_idx as f64 + pos).clamp(min, max);
+        let new_idx = new_idx.round() as usize;
+
+        self.active_workspace_idx = new_idx;
+        self.workspace_switch = Some(WorkspaceSwitch::Animation(Animation::new(
+            gesture.current_idx,
+            new_idx as f64,
+            self.options.animations.workspace_switch,
+            niri_config::Animation::default_workspace_switch(),
+        )));
+
+        true
     }
 }

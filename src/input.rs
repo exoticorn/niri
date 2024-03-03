@@ -1,6 +1,8 @@
 use std::any::Any;
 use std::collections::HashSet;
+use std::time::Duration;
 
+use input::event::gesture::GestureEventCoordinates as _;
 use niri_config::{Action, Binds, Modifiers};
 use niri_ipc::LayoutSwitchTarget;
 use smithay::backend::input::{
@@ -40,7 +42,7 @@ pub struct TabletData {
 }
 
 impl State {
-    pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>)
+    pub fn process_input_event<I: InputBackend + 'static>(&mut self, event: InputEvent<I>)
     where
         I::Device: 'static, // Needed for downcasting.
     {
@@ -1203,13 +1205,7 @@ impl State {
 
     fn on_gesture_swipe_begin<I: InputBackend>(&mut self, event: I::GestureSwipeBeginEvent) {
         if event.fingers() == 3 {
-            if let Some(output) = self.niri.output_under_cursor() {
-                self.niri.layout.workspace_switch_gesture_begin(&output);
-
-                // FIXME: granular. This one is awkward because this can cancel a gesture on
-                // multiple other outputs in theory.
-                self.niri.queue_redraw_all();
-            }
+            self.niri.gesture_swipe_3f_cumulative = Some((0., 0.));
 
             // We handled this event.
             return;
@@ -1232,25 +1228,75 @@ impl State {
         );
     }
 
-    fn on_gesture_swipe_update<I: InputBackend>(&mut self, event: I::GestureSwipeUpdateEvent)
-    where
+    fn on_gesture_swipe_update<I: InputBackend + 'static>(
+        &mut self,
+        event: I::GestureSwipeUpdateEvent,
+    ) where
         I::Device: 'static,
     {
+        let mut delta_x = event.delta_x();
         let mut delta_y = event.delta_y();
+
+        if let Some(libinput_event) =
+            (&event as &dyn Any).downcast_ref::<input::event::gesture::GestureSwipeUpdateEvent>()
+        {
+            delta_x = libinput_event.dx_unaccelerated();
+            delta_y = libinput_event.dy_unaccelerated();
+        }
 
         let device = event.device();
         if let Some(device) = (&device as &dyn Any).downcast_ref::<input::Device>() {
             if device.config_scroll_natural_scroll_enabled() {
+                delta_x = -delta_x;
                 delta_y = -delta_y;
             }
         }
 
-        let res = self.niri.layout.workspace_switch_gesture_update(delta_y);
+        if let Some((cx, cy)) = &mut self.niri.gesture_swipe_3f_cumulative {
+            *cx += delta_x;
+            *cy += delta_y;
+
+            // Check if the gesture moved far enough to decide. Threshold copied from GNOME Shell.
+            let (cx, cy) = (*cx, *cy);
+            if cx * cx + cy * cy >= 16. * 16. {
+                self.niri.gesture_swipe_3f_cumulative = None;
+
+                if let Some(output) = self.niri.output_under_cursor() {
+                    if cx.abs() > cy.abs() {
+                        self.niri.layout.view_offset_gesture_begin(&output);
+                    } else {
+                        self.niri.layout.workspace_switch_gesture_begin(&output);
+                    }
+                }
+            }
+        }
+
+        let timestamp = Duration::from_micros(event.time());
+
+        let mut handled = false;
+        let res = self
+            .niri
+            .layout
+            .workspace_switch_gesture_update(delta_y, timestamp);
         if let Some(output) = res {
             if let Some(output) = output {
                 self.niri.queue_redraw(output);
             }
+            handled = true;
+        }
 
+        let res = self
+            .niri
+            .layout
+            .view_offset_gesture_update(delta_x, timestamp);
+        if let Some(output) = res {
+            if let Some(output) = output {
+                self.niri.queue_redraw(output);
+            }
+            handled = true;
+        }
+
+        if handled {
             // We handled this event.
             return;
         }
@@ -1271,13 +1317,25 @@ impl State {
     }
 
     fn on_gesture_swipe_end<I: InputBackend>(&mut self, event: I::GestureSwipeEndEvent) {
+        self.niri.gesture_swipe_3f_cumulative = None;
+
+        let mut handled = false;
         let res = self
             .niri
             .layout
             .workspace_switch_gesture_end(event.cancelled());
         if let Some(output) = res {
             self.niri.queue_redraw(output);
+            handled = true;
+        }
 
+        let res = self.niri.layout.view_offset_gesture_end(event.cancelled());
+        if let Some(output) = res {
+            self.niri.queue_redraw(output);
+            handled = true;
+        }
+
+        if handled {
             // We handled this event.
             return;
         }
@@ -1645,7 +1703,7 @@ fn bound_action(
         }
 
         if bind_modifiers == modifiers {
-            return bind.actions.first().cloned();
+            return Some(bind.action.clone());
         }
     }
 
@@ -1810,7 +1868,7 @@ mod tests {
                 keysym: close_keysym,
                 modifiers: Modifiers::COMPOSITOR | Modifiers::CTRL,
             },
-            actions: vec![Action::CloseWindow],
+            action: Action::CloseWindow,
         }]);
 
         let comp_mod = CompositorMod::Super;
@@ -1935,35 +1993,35 @@ mod tests {
                     keysym: Keysym::q,
                     modifiers: Modifiers::COMPOSITOR,
                 },
-                actions: vec![Action::CloseWindow],
+                action: Action::CloseWindow,
             },
             Bind {
                 key: Key {
                     keysym: Keysym::h,
                     modifiers: Modifiers::SUPER,
                 },
-                actions: vec![Action::FocusColumnLeft],
+                action: Action::FocusColumnLeft,
             },
             Bind {
                 key: Key {
                     keysym: Keysym::j,
                     modifiers: Modifiers::empty(),
                 },
-                actions: vec![Action::FocusWindowDown],
+                action: Action::FocusWindowDown,
             },
             Bind {
                 key: Key {
                     keysym: Keysym::k,
                     modifiers: Modifiers::COMPOSITOR | Modifiers::SUPER,
                 },
-                actions: vec![Action::FocusWindowUp],
+                action: Action::FocusWindowUp,
             },
             Bind {
                 key: Key {
                     keysym: Keysym::l,
                     modifiers: Modifiers::SUPER | Modifiers::ALT,
                 },
-                actions: vec![Action::FocusColumnRight],
+                action: Action::FocusColumnRight,
             },
         ]);
 
