@@ -34,7 +34,7 @@ use std::mem;
 use std::rc::Rc;
 use std::time::Duration;
 
-use niri_config::{self, CenterFocusedColumn, Config, Struts};
+use niri_config::{CenterFocusedColumn, Config, Struts};
 use niri_ipc::SizeChange;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
@@ -64,7 +64,7 @@ pub mod tile;
 pub mod workspace;
 
 niri_render_elements! {
-    LayoutElementRenderElement => {
+    LayoutElementRenderElement<R> => {
         Wayland = WaylandSurfaceRenderElement<R>,
         SolidColor = SolidColorRenderElement,
     }
@@ -247,35 +247,45 @@ impl LayoutElement for Window {
     }
 
     fn request_size(&self, size: Size<i32, Logical>) {
-        self.toplevel().with_pending_state(|state| {
-            state.size = Some(size);
-            state.states.unset(xdg_toplevel::State::Fullscreen);
-        });
+        self.toplevel()
+            .expect("no x11 support")
+            .with_pending_state(|state| {
+                state.size = Some(size);
+                state.states.unset(xdg_toplevel::State::Fullscreen);
+            });
     }
 
     fn request_fullscreen(&self, size: Size<i32, Logical>) {
-        self.toplevel().with_pending_state(|state| {
-            state.size = Some(size);
-            state.states.set(xdg_toplevel::State::Fullscreen);
-        });
+        self.toplevel()
+            .expect("no x11 support")
+            .with_pending_state(|state| {
+                state.size = Some(size);
+                state.states.set(xdg_toplevel::State::Fullscreen);
+            });
     }
 
     fn min_size(&self) -> Size<i32, Logical> {
-        with_states(self.toplevel().wl_surface(), |state| {
-            let curr = state.cached_state.current::<SurfaceCachedState>();
-            curr.min_size
-        })
+        with_states(
+            self.toplevel().expect("no x11 support").wl_surface(),
+            |state| {
+                let curr = state.cached_state.current::<SurfaceCachedState>();
+                curr.min_size
+            },
+        )
     }
 
     fn max_size(&self) -> Size<i32, Logical> {
-        with_states(self.toplevel().wl_surface(), |state| {
-            let curr = state.cached_state.current::<SurfaceCachedState>();
-            curr.max_size
-        })
+        with_states(
+            self.toplevel().expect("no x11 support").wl_surface(),
+            |state| {
+                let curr = state.cached_state.current::<SurfaceCachedState>();
+                curr.max_size
+            },
+        )
     }
 
     fn is_wl_surface(&self, wl_surface: &WlSurface) -> bool {
-        self.toplevel().wl_surface() == wl_surface
+        self.toplevel().expect("no x11 support").wl_surface() == wl_surface
     }
 
     fn set_preferred_scale_transform(&self, scale: i32, transform: Transform) {
@@ -285,7 +295,10 @@ impl LayoutElement for Window {
     }
 
     fn has_ssd(&self) -> bool {
-        self.toplevel().current_state().decoration_mode
+        self.toplevel()
+            .expect("no x11 support")
+            .current_state()
+            .decoration_mode
             == Some(zxdg_toplevel_decoration_v1::Mode::ServerSide)
     }
 
@@ -305,6 +318,7 @@ impl LayoutElement for Window {
 
     fn is_fullscreen(&self) -> bool {
         self.toplevel()
+            .expect("no x11 support")
             .current_state()
             .states
             .contains(xdg_toplevel::State::Fullscreen)
@@ -312,6 +326,7 @@ impl LayoutElement for Window {
 
     fn is_pending_fullscreen(&self) -> bool {
         self.toplevel()
+            .expect("no x11 support")
             .with_pending_state(|state| state.states.contains(xdg_toplevel::State::Fullscreen))
     }
 }
@@ -531,15 +546,15 @@ impl<W: LayoutElement> Layout<W> {
     pub fn add_window(
         &mut self,
         window: W,
-        width: Option<Option<ColumnWidth>>,
+        width: Option<ColumnWidth>,
         is_full_width: bool,
     ) -> Option<&Output> {
-        let width = match width {
-            Some(Some(width)) => Some(width),
-            Some(None) => None,
-            None => self.options.default_width,
+        let mut width = width.unwrap_or_else(|| ColumnWidth::Fixed(window.size().w));
+        if let ColumnWidth::Fixed(w) = &mut width {
+            if !self.options.border.off {
+                *w += self.options.border.width as i32 * 2;
+            }
         }
-        .unwrap_or_else(|| ColumnWidth::Fixed(window.size().w));
 
         match &mut self.monitor_set {
             MonitorSet::Normal {
@@ -587,15 +602,15 @@ impl<W: LayoutElement> Layout<W> {
         &mut self,
         right_of: &W,
         window: W,
-        width: Option<Option<ColumnWidth>>,
+        width: Option<ColumnWidth>,
         is_full_width: bool,
     ) -> Option<&Output> {
-        let width = match width {
-            Some(Some(width)) => Some(width),
-            Some(None) => None,
-            None => self.options.default_width,
+        let mut width = width.unwrap_or_else(|| ColumnWidth::Fixed(window.size().w));
+        if let ColumnWidth::Fixed(w) = &mut width {
+            if !self.options.border.off {
+                *w += self.options.border.width as i32 * 2;
+            }
         }
-        .unwrap_or_else(|| ColumnWidth::Fixed(window.size().w));
 
         match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => {
@@ -623,15 +638,15 @@ impl<W: LayoutElement> Layout<W> {
         &mut self,
         output: &Output,
         window: W,
-        width: Option<Option<ColumnWidth>>,
+        width: Option<ColumnWidth>,
         is_full_width: bool,
     ) {
-        let width = match width {
-            Some(Some(width)) => Some(width),
-            Some(None) => None,
-            None => self.options.default_width,
+        let mut width = width.unwrap_or_else(|| ColumnWidth::Fixed(window.size().w));
+        if let ColumnWidth::Fixed(w) = &mut width {
+            if !self.options.border.off {
+                *w += self.options.border.width as i32 * 2;
+            }
         }
-        .unwrap_or_else(|| ColumnWidth::Fixed(window.size().w));
 
         let MonitorSet::Normal {
             monitors,
@@ -885,7 +900,7 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         let col = &ws.columns[ws.active_column_idx];
-        Some((&col.tiles[col.active_tile_idx].window(), &mon.output))
+        Some((col.tiles[col.active_tile_idx].window(), &mon.output))
     }
 
     pub fn windows_for_output(&self, output: &Output) -> impl Iterator<Item = &W> + '_ {
@@ -929,6 +944,19 @@ impl<W: LayoutElement> Layout<W> {
         };
 
         Some(&mut monitors[*active_monitor_idx])
+    }
+
+    pub fn active_monitor_ref(&self) -> Option<&Monitor<W>> {
+        let MonitorSet::Normal {
+            monitors,
+            active_monitor_idx,
+            ..
+        } = &self.monitor_set
+        else {
+            return None;
+        };
+
+        Some(&monitors[*active_monitor_idx])
     }
 
     pub fn monitor_for_output(&self, output: &Output) -> Option<&Monitor<W>> {
@@ -1437,15 +1465,10 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn move_window_to_output(&mut self, window: W, output: &Output) {
-        if !matches!(&self.monitor_set, MonitorSet::Normal { .. }) {
-            return;
-        }
-
-        self.remove_window(&window);
+        let mut width = None;
+        let mut is_full_width = false;
 
         if let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set {
-            let mut width = None;
-            let mut is_full_width = false;
             for mon in &*monitors {
                 for ws in &mon.workspaces {
                     for col in &ws.columns {
@@ -1457,8 +1480,13 @@ impl<W: LayoutElement> Layout<W> {
                     }
                 }
             }
-            let Some(width) = width else { return };
+        }
 
+        let Some(width) = width else { return };
+
+        self.remove_window(&window);
+
+        if let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set {
             let new_idx = monitors
                 .iter()
                 .position(|mon| &mon.output == output)

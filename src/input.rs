@@ -24,8 +24,9 @@ use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerCons
 use smithay::wayland::tablet_manager::{TabletDescriptor, TabletSeatTrait};
 
 use crate::niri::State;
-use crate::screenshot_ui::ScreenshotUi;
-use crate::utils::{center, get_monotonic_time, spawn};
+use crate::ui::screenshot_ui::ScreenshotUi;
+use crate::utils::spawning::spawn;
+use crate::utils::{center, get_monotonic_time};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompositorMod {
@@ -155,9 +156,14 @@ impl State {
                     }
                 }
 
+                if device.has_capability(input::DeviceCapability::Touch) {
+                    self.niri.touch.insert(device.clone());
+                }
+
                 apply_libinput_settings(&self.niri.config.borrow().input, device);
             }
             InputEvent::DeviceRemoved { device } => {
+                self.niri.touch.remove(device);
                 self.niri.tablets.remove(device);
                 self.niri.devices.remove(device);
             }
@@ -188,6 +194,9 @@ impl State {
             if tablet_seat.count_tablets() == 0 {
                 tablet_seat.clear_tools();
             }
+        }
+        if device.has_capability(DeviceCapability::Touch) && self.niri.touch.is_empty() {
+            self.niri.seat.remove_touch();
         }
     }
 
@@ -385,7 +394,7 @@ impl State {
             }
             Action::CloseWindow => {
                 if let Some(window) = self.niri.layout.focus() {
-                    window.toplevel().send_close();
+                    window.toplevel().expect("no x11 support").send_close();
                 }
             }
             Action::FullscreenWindow => {
@@ -1380,30 +1389,20 @@ impl State {
         );
     }
 
-    fn touch_location_transformed<I: InputBackend, E: AbsolutePositionEvent<I>>(
+    /// Computes the cursor position for the touch event.
+    ///
+    /// This function handles the touch output mapping, as well as coordinate transform
+    fn compute_touch_location<I: InputBackend, E: AbsolutePositionEvent<I>>(
         &self,
         evt: &E,
     ) -> Option<Point<f64, Logical>> {
-        let output = self
-            .niri
-            .global_space
-            .outputs()
-            .find(|output| output.name().starts_with("eDP"))
-            .or_else(|| self.niri.global_space.outputs().next());
-
-        let Some(output) = output else {
-            return None;
-        };
-
-        let Some(output_geometry) = self.niri.global_space.output_geometry(output) else {
-            return None;
-        };
-
+        let output = self.niri.output_for_touch()?;
+        let output_geo = self.niri.global_space.output_geometry(output).unwrap();
         let transform = output.current_transform();
-        let size = transform.invert().transform_size(output_geometry.size);
+        let size = transform.invert().transform_size(output_geo.size);
         Some(
             transform.transform_point_in(evt.position_transformed(size), &size.to_f64())
-                + output_geometry.loc.to_f64(),
+                + output_geo.loc.to_f64(),
         )
     }
 
@@ -1411,9 +1410,31 @@ impl State {
         let Some(handle) = self.niri.seat.get_touch() else {
             return;
         };
-        let Some(touch_location) = self.touch_location_transformed(&evt) else {
+        let Some(touch_location) = self.compute_touch_location(&evt) else {
             return;
         };
+
+        if !handle.is_grabbed() {
+            let output_under_touch = self
+                .niri
+                .global_space
+                .output_under(touch_location)
+                .next()
+                .cloned();
+            if let Some(window) = self.niri.window_under(touch_location) {
+                let window = window.clone();
+                self.niri.layout.activate_window(&window);
+
+                // FIXME: granular.
+                self.niri.queue_redraw_all();
+            } else if let Some(output) = output_under_touch {
+                self.niri.layout.activate_output(&output);
+
+                // FIXME: granular.
+                self.niri.queue_redraw_all();
+            };
+        };
+
         let serial = SERIAL_COUNTER.next_serial();
         let under = self
             .niri
@@ -1448,7 +1469,7 @@ impl State {
         let Some(handle) = self.niri.seat.get_touch() else {
             return;
         };
-        let Some(touch_location) = self.touch_location_transformed(&evt) else {
+        let Some(touch_location) = self.compute_touch_location(&evt) else {
             return;
         };
         let under = self
@@ -1777,7 +1798,7 @@ pub fn apply_libinput_settings(config: &niri_config::Input, device: &mut input::
 
 #[cfg(test)]
 mod tests {
-    use niri_config::{Action, Bind, Binds, Key, Modifiers};
+    use niri_config::{Bind, Key};
 
     use super::*;
 

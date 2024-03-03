@@ -1,12 +1,9 @@
 use std::ffi::{CString, OsStr};
-use std::io::{self, Write};
+use std::io::Write;
 use std::os::unix::prelude::OsStrExt;
-use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use anyhow::{ensure, Context};
@@ -16,6 +13,11 @@ use niri_config::Config;
 use smithay::output::Output;
 use smithay::reexports::rustix::time::{clock_gettime, ClockId};
 use smithay::utils::{Logical, Point, Rectangle, Size};
+
+pub mod spawning;
+pub mod watcher;
+
+pub static IS_SYSTEMD_SERVICE: AtomicBool = AtomicBool::new(false);
 
 pub fn clone2<T: Clone, U: Clone>(t: (&T, &U)) -> (T, U) {
     (t.0.clone(), t.1.clone())
@@ -48,6 +50,15 @@ pub fn output_size(output: &Output) -> Size<i32, Logical> {
         .to_logical(output_scale)
 }
 
+pub fn expand_home(path: &Path) -> anyhow::Result<Option<PathBuf>> {
+    if let Ok(rest) = path.strip_prefix("~") {
+        let dirs = UserDirs::new().context("error retrieving home directory")?;
+        Ok(Some([dirs.home_dir(), rest].iter().collect()))
+    } else {
+        Ok(None)
+    }
+}
+
 pub fn make_screenshot_path(config: &Config) -> anyhow::Result<Option<PathBuf>> {
     let Some(path) = &config.screenshot_path else {
         return Ok(None);
@@ -70,89 +81,11 @@ pub fn make_screenshot_path(config: &Config) -> anyhow::Result<Option<PathBuf>> 
         path = PathBuf::from(OsStr::from_bytes(&buf[..rv]));
     }
 
-    if let Ok(rest) = path.strip_prefix("~") {
-        let dirs = UserDirs::new().context("error retrieving home directory")?;
-        path = [dirs.home_dir(), rest].iter().collect();
+    if let Some(expanded) = expand_home(&path).context("error expanding ~")? {
+        path = expanded;
     }
 
     Ok(Some(path))
-}
-
-pub static REMOVE_ENV_RUST_BACKTRACE: AtomicBool = AtomicBool::new(false);
-pub static REMOVE_ENV_RUST_LIB_BACKTRACE: AtomicBool = AtomicBool::new(false);
-
-/// Spawns the command to run independently of the compositor.
-pub fn spawn<T: AsRef<OsStr> + Send + 'static>(command: Vec<T>) {
-    let _span = tracy_client::span!();
-
-    if command.is_empty() {
-        return;
-    }
-
-    // Spawning and waiting takes some milliseconds, so do it in a thread.
-    let res = thread::Builder::new()
-        .name("Command Spawner".to_owned())
-        .spawn(move || {
-            let (command, args) = command.split_first().unwrap();
-            spawn_sync(command, args);
-        });
-
-    if let Err(err) = res {
-        warn!("error spawning a thread to spawn the command: {err:?}");
-    }
-}
-
-fn spawn_sync(command: impl AsRef<OsStr>, args: impl IntoIterator<Item = impl AsRef<OsStr>>) {
-    let _span = tracy_client::span!();
-
-    let command = command.as_ref();
-
-    let mut process = Command::new(command);
-    process
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-
-    // Remove RUST_BACKTRACE and RUST_LIB_BACKTRACE from the environment if needed.
-    if REMOVE_ENV_RUST_BACKTRACE.load(Ordering::Relaxed) {
-        process.env_remove("RUST_BACKTRACE");
-    }
-    if REMOVE_ENV_RUST_LIB_BACKTRACE.load(Ordering::Relaxed) {
-        process.env_remove("RUST_LIB_BACKTRACE");
-    }
-
-    // Double-fork to avoid having to waitpid the child.
-    unsafe {
-        process.pre_exec(|| {
-            match libc::fork() {
-                -1 => return Err(io::Error::last_os_error()),
-                0 => (),
-                _ => libc::_exit(0),
-            }
-
-            Ok(())
-        });
-    }
-
-    let mut child = match process.spawn() {
-        Ok(child) => child,
-        Err(err) => {
-            warn!("error spawning {command:?}: {err:?}");
-            return;
-        }
-    };
-
-    match child.wait() {
-        Ok(status) => {
-            if !status.success() {
-                warn!("child did not exit successfully: {status:?}");
-            }
-        }
-        Err(err) => {
-            warn!("error waiting for child: {err:?}");
-        }
-    }
 }
 
 pub fn write_png_rgba8(

@@ -51,6 +51,8 @@ impl Layout {
                 width: 4,
                 active_color: Color::new(255, 163, 72, 255),
                 inactive_color: Color::new(50, 50, 50, 255),
+                active_gradient: None,
+                inactive_gradient: None,
             },
             ..Default::default()
         };
@@ -143,8 +145,7 @@ impl Layout {
     }
 
     fn add_window(&mut self, window: TestWindow, width: Option<ColumnWidth>) {
-        self.layout
-            .add_window(window.clone(), width.map(Some), false);
+        self.layout.add_window(window.clone(), width, false);
         if window.communicate() {
             self.layout.update_window(&window);
         }
@@ -158,7 +159,7 @@ impl Layout {
         width: Option<ColumnWidth>,
     ) {
         self.layout
-            .add_window_right_of(right_of, window.clone(), width.map(Some), false);
+            .add_window_right_of(right_of, window.clone(), width, false);
         if window.communicate() {
             self.layout.update_window(&window);
         }

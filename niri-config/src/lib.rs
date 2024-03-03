@@ -39,6 +39,8 @@ pub struct Config {
     pub hotkey_overlay: HotkeyOverlay,
     #[knuffel(child, default)]
     pub animations: Animations,
+    #[knuffel(child, default)]
+    pub environment: Environment,
     #[knuffel(children(name = "window-rule"))]
     pub window_rules: Vec<WindowRule>,
     #[knuffel(child, default)]
@@ -60,6 +62,8 @@ pub struct Input {
     pub trackpoint: Trackpoint,
     #[knuffel(child, default)]
     pub tablet: Tablet,
+    #[knuffel(child, default)]
+    pub touch: Touch,
     #[knuffel(child)]
     pub disable_power_key_handling: bool,
 }
@@ -195,6 +199,12 @@ impl From<TapButtonMap> for input::TapButtonMap {
 
 #[derive(knuffel::Decode, Debug, Default, PartialEq)]
 pub struct Tablet {
+    #[knuffel(child, unwrap(argument))]
+    pub map_to_output: Option<String>,
+}
+
+#[derive(knuffel::Decode, Debug, Default, PartialEq)]
+pub struct Touch {
     #[knuffel(child, unwrap(argument))]
     pub map_to_output: Option<String>,
 }
@@ -340,6 +350,10 @@ pub struct FocusRing {
     pub active_color: Color,
     #[knuffel(child, default = Self::default().inactive_color)]
     pub inactive_color: Color,
+    #[knuffel(child)]
+    pub active_gradient: Option<Gradient>,
+    #[knuffel(child)]
+    pub inactive_gradient: Option<Gradient>,
 }
 
 impl Default for FocusRing {
@@ -349,8 +363,29 @@ impl Default for FocusRing {
             width: 4,
             active_color: Color::new(127, 200, 255, 255),
             inactive_color: Color::new(80, 80, 80, 255),
+            active_gradient: None,
+            inactive_gradient: None,
         }
     }
+}
+
+#[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq)]
+pub struct Gradient {
+    #[knuffel(property, str)]
+    pub from: Color,
+    #[knuffel(property, str)]
+    pub to: Color,
+    #[knuffel(property, default = 180)]
+    pub angle: i16,
+    #[knuffel(property, default)]
+    pub relative_to: GradientRelativeTo,
+}
+
+#[derive(knuffel::DecodeScalar, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum GradientRelativeTo {
+    #[default]
+    Window,
+    WorkspaceView,
 }
 
 #[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq)]
@@ -363,6 +398,10 @@ pub struct Border {
     pub active_color: Color,
     #[knuffel(child, default = Self::default().inactive_color)]
     pub inactive_color: Color,
+    #[knuffel(child)]
+    pub active_gradient: Option<Gradient>,
+    #[knuffel(child)]
+    pub inactive_gradient: Option<Gradient>,
 }
 
 impl Default for Border {
@@ -372,6 +411,8 @@ impl Default for Border {
             width: 4,
             active_color: Color::new(255, 200, 127, 255),
             inactive_color: Color::new(80, 80, 80, 255),
+            active_gradient: None,
+            inactive_gradient: None,
         }
     }
 }
@@ -383,19 +424,17 @@ impl From<Border> for FocusRing {
             width: value.width,
             active_color: value.active_color,
             inactive_color: value.inactive_color,
+            active_gradient: value.active_gradient,
+            inactive_gradient: value.inactive_gradient,
         }
     }
 }
 
-#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Color {
-    #[knuffel(argument)]
     pub r: u8,
-    #[knuffel(argument)]
     pub g: u8,
-    #[knuffel(argument)]
     pub b: u8,
-    #[knuffel(argument)]
     pub a: u8,
 }
 
@@ -539,6 +578,17 @@ pub enum AnimationCurve {
     EaseOutExpo,
 }
 
+#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq, Eq)]
+pub struct Environment(#[knuffel(children)] pub Vec<EnvironmentVariable>);
+
+#[derive(knuffel::Decode, Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentVariable {
+    #[knuffel(node_name)]
+    pub name: String,
+    #[knuffel(argument)]
+    pub value: Option<String>,
+}
+
 #[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
 pub struct WindowRule {
     #[knuffel(children(name = "match"))]
@@ -550,6 +600,10 @@ pub struct WindowRule {
     pub default_column_width: Option<DefaultColumnWidth>,
     #[knuffel(child, unwrap(argument))]
     pub open_on_output: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    pub open_maximized: Option<bool>,
+    #[knuffel(child, unwrap(argument))]
+    pub open_fullscreen: Option<bool>,
 }
 
 #[derive(knuffel::Decode, Debug, Default, Clone)]
@@ -792,6 +846,106 @@ impl Default for Config {
     }
 }
 
+impl FromStr for Color {
+    type Err = miette::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let [r, g, b, a] = csscolorparser::parse(s).into_diagnostic()?.to_rgba8();
+        Ok(Self { r, g, b, a })
+    }
+}
+
+#[derive(knuffel::Decode)]
+struct ColorRgba {
+    #[knuffel(argument)]
+    r: u8,
+    #[knuffel(argument)]
+    g: u8,
+    #[knuffel(argument)]
+    b: u8,
+    #[knuffel(argument)]
+    a: u8,
+}
+
+impl From<ColorRgba> for Color {
+    fn from(value: ColorRgba) -> Self {
+        let ColorRgba { r, g, b, a } = value;
+        Self { r, g, b, a }
+    }
+}
+
+// Manual impl to allow both one-argument string and 4-argument RGBA forms.
+impl<S> knuffel::Decode<S> for Color
+where
+    S: knuffel::traits::ErrorSpan,
+{
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, knuffel::errors::DecodeError<S>> {
+        // Check for unexpected type name.
+        if let Some(type_name) = &node.type_name {
+            ctx.emit_error(knuffel::errors::DecodeError::unexpected(
+                type_name,
+                "type name",
+                "no type name expected for this node",
+            ));
+        }
+
+        // Get the first argument.
+        let mut iter_args = node.arguments.iter();
+        let val = iter_args.next().ok_or_else(|| {
+            knuffel::errors::DecodeError::missing(node, "additional argument is required")
+        })?;
+
+        // Check for unexpected type name.
+        if let Some(typ) = &val.type_name {
+            ctx.emit_error(knuffel::errors::DecodeError::TypeName {
+                span: typ.span().clone(),
+                found: Some((**typ).clone()),
+                expected: knuffel::errors::ExpectedType::no_type(),
+                rust_type: "str",
+            });
+        }
+
+        // Check the argument type.
+        let rv = match *val.literal {
+            // If it's a string, use FromStr.
+            knuffel::ast::Literal::String(ref s) => Color::from_str(s)
+                .map_err(|e| knuffel::errors::DecodeError::conversion(&val.literal, e)),
+            // Otherwise, fall back to the 4-argument RGBA form.
+            _ => return ColorRgba::decode_node(node, ctx).map(Color::from),
+        }?;
+
+        // Check for unexpected following arguments.
+        if let Some(val) = iter_args.next() {
+            ctx.emit_error(knuffel::errors::DecodeError::unexpected(
+                &val.literal,
+                "argument",
+                "unexpected argument",
+            ));
+        }
+
+        // Check for unexpected properties and children.
+        for name in node.properties.keys() {
+            ctx.emit_error(knuffel::errors::DecodeError::unexpected(
+                name,
+                "property",
+                format!("unexpected property `{}`", name.escape_default()),
+            ));
+        }
+        for child in node.children.as_ref().map(|lst| &lst[..]).unwrap_or(&[]) {
+            ctx.emit_error(knuffel::errors::DecodeError::unexpected(
+                child,
+                "node",
+                format!("unexpected node `{}`", child.node_name.escape_default()),
+            ));
+        }
+
+        Ok(rv)
+    }
+}
+
 impl FromStr for Mode {
     type Err = miette::Error;
 
@@ -911,7 +1065,7 @@ mod tests {
     #[test]
     fn parse() {
         check(
-            r#"
+            r##"
             input {
                 keyboard {
                     repeat-delay 600
@@ -948,6 +1102,10 @@ mod tests {
                     map-to-output "eDP-1"
                 }
 
+                touch {
+                    map-to-output "eDP-1"
+                }
+
                 disable-power-key-handling
             }
 
@@ -963,11 +1121,12 @@ mod tests {
                     width 5
                     active-color 0 100 200 255
                     inactive-color 255 200 100 0
+                    active-gradient from="rgba(10, 20, 30, 1.0)" to="#0080ffff" relative-to="workspace-view"
                 }
 
                 border {
                     width 3
-                    inactive-color 255 200 100 0
+                    inactive-color "rgba(255, 200, 100, 0.0)"
                 }
 
                 preset-column-widths {
@@ -1016,11 +1175,18 @@ mod tests {
                 }
             }
 
+            environment {
+                QT_QPA_PLATFORM "wayland"
+                DISPLAY null
+            }
+
             window-rule {
                 match app-id=".*alacritty"
                 exclude title="~"
 
                 open-on-output "eDP-1"
+                open-maximized true
+                open-fullscreen false
             }
 
             binds {
@@ -1036,7 +1202,7 @@ mod tests {
             debug {
                 render-drm-device "/dev/dri/renderD129"
             }
-            "#,
+            "##,
             Config {
                 input: Input {
                     keyboard: Keyboard {
@@ -1071,6 +1237,9 @@ mod tests {
                     tablet: Tablet {
                         map_to_output: Some("eDP-1".to_owned()),
                     },
+                    touch: Touch {
+                        map_to_output: Some("eDP-1".to_owned()),
+                    },
                     disable_power_key_handling: true,
                 },
                 outputs: vec![Output {
@@ -1101,6 +1270,13 @@ mod tests {
                             b: 100,
                             a: 0,
                         },
+                        active_gradient: Some(Gradient {
+                            from: Color::new(10, 20, 30, 255),
+                            to: Color::new(0, 128, 255, 255),
+                            angle: 180,
+                            relative_to: GradientRelativeTo::WorkspaceView,
+                        }),
+                        inactive_gradient: None,
                     },
                     border: Border {
                         off: false,
@@ -1117,6 +1293,8 @@ mod tests {
                             b: 100,
                             a: 0,
                         },
+                        active_gradient: None,
+                        inactive_gradient: None,
                     },
                     preset_column_widths: vec![
                         PresetWidth::Proportion(0.25),
@@ -1161,6 +1339,16 @@ mod tests {
                     },
                     ..Default::default()
                 },
+                environment: Environment(vec![
+                    EnvironmentVariable {
+                        name: String::from("QT_QPA_PLATFORM"),
+                        value: Some(String::from("wayland")),
+                    },
+                    EnvironmentVariable {
+                        name: String::from("DISPLAY"),
+                        value: None,
+                    },
+                ]),
                 window_rules: vec![WindowRule {
                     matches: vec![Match {
                         app_id: Some(Regex::new(".*alacritty").unwrap()),
@@ -1171,6 +1359,8 @@ mod tests {
                         title: Some(Regex::new("~").unwrap()),
                     }],
                     open_on_output: Some("eDP-1".to_owned()),
+                    open_maximized: Some(true),
+                    open_fullscreen: Some(false),
                     ..Default::default()
                 }],
                 binds: Binds(vec![

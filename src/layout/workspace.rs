@@ -8,6 +8,7 @@ use niri_ipc::SizeChange;
 use smithay::desktop::space::SpaceElement;
 use smithay::desktop::{layer_map_for_output, Window};
 use smithay::output::Output;
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 
@@ -75,7 +76,7 @@ pub struct Workspace<W: LayoutElement> {
 pub struct OutputId(String);
 
 niri_render_elements! {
-    WorkspaceRenderElement => {
+    WorkspaceRenderElement<R> => {
         Tile = TileRenderElement<R>,
     }
 }
@@ -321,21 +322,27 @@ impl<W: LayoutElement> Workspace<W> {
         ))
     }
 
-    pub fn new_window_size(
+    pub fn resolve_default_width(
         &self,
         default_width: Option<Option<ColumnWidth>>,
-    ) -> Size<i32, Logical> {
-        let default_width = match default_width {
+    ) -> Option<ColumnWidth> {
+        match default_width {
             Some(Some(width)) => Some(width),
             Some(None) => None,
             None => self.options.default_width,
-        };
+        }
+    }
 
-        let width = if let Some(width) = default_width {
+    pub fn new_window_size(&self, width: Option<ColumnWidth>) -> Size<i32, Logical> {
+        let width = if let Some(width) = width {
+            let is_fixed = matches!(width, ColumnWidth::Fixed(_));
+
             let mut width = width.resolve(&self.options, self.working_area.size.w);
-            if !self.options.border.off {
+
+            if !is_fixed && !self.options.border.off {
                 width -= self.options.border.width as i32 * 2;
             }
+
             max(1, width)
         } else {
             0
@@ -349,22 +356,23 @@ impl<W: LayoutElement> Workspace<W> {
         Size::from((width, max(height, 1)))
     }
 
-    pub fn configure_new_window(
-        &self,
-        window: &Window,
-        default_width: Option<Option<ColumnWidth>>,
-    ) {
-        let size = self.new_window_size(default_width);
-        let bounds = self.toplevel_bounds();
-
+    pub fn configure_new_window(&self, window: &Window, width: Option<ColumnWidth>) {
         if let Some(output) = self.output.as_ref() {
             set_preferred_scale_transform(window, output);
         }
 
-        window.toplevel().with_pending_state(|state| {
-            state.size = Some(size);
-            state.bounds = Some(bounds);
-        });
+        window
+            .toplevel()
+            .expect("no x11 support")
+            .with_pending_state(|state| {
+                if state.states.contains(xdg_toplevel::State::Fullscreen) {
+                    state.size = Some(self.view_size);
+                } else {
+                    state.size = Some(self.new_window_size(width));
+                }
+
+                state.bounds = Some(self.toplevel_bounds());
+            });
     }
 
     fn compute_new_view_offset_for_column(&self, current_x: i32, idx: usize) -> i32 {
@@ -1185,7 +1193,7 @@ impl<W: LayoutElement> Workspace<W> {
             first = false;
 
             rv.extend(
-                tile.render(renderer, tile_pos, output_scale, focus_ring)
+                tile.render(renderer, tile_pos, output_scale, self.view_size, focus_ring)
                     .map(Into::into),
             );
         }
@@ -1206,11 +1214,15 @@ impl Workspace<Window> {
                     && col.active_tile_idx == tile_idx;
                 win.set_activated(active);
 
-                win.toplevel().with_pending_state(|state| {
-                    state.bounds = Some(bounds);
-                });
+                win.toplevel()
+                    .expect("no x11 support")
+                    .with_pending_state(|state| {
+                        state.bounds = Some(bounds);
+                    });
 
-                win.toplevel().send_pending_configure();
+                win.toplevel()
+                    .expect("no x11 support")
+                    .send_pending_configure();
                 win.refresh();
             }
         }

@@ -15,14 +15,15 @@ use niri::cli::{Cli, Sub};
 use niri::dbus;
 use niri::ipc::client::handle_msg;
 use niri::niri::State;
-use niri::utils::{
-    cause_panic, spawn, version, REMOVE_ENV_RUST_BACKTRACE, REMOVE_ENV_RUST_LIB_BACKTRACE,
+use niri::utils::spawning::{
+    spawn, CHILD_ENV, REMOVE_ENV_RUST_BACKTRACE, REMOVE_ENV_RUST_LIB_BACKTRACE,
 };
-use niri::watcher::Watcher;
+use niri::utils::watcher::Watcher;
+use niri::utils::{cause_panic, version, IS_SYSTEMD_SERVICE};
 use niri_config::Config;
 use portable_atomic::Ordering;
 use sd_notify::NotifyState;
-use smithay::reexports::calloop::{self, EventLoop};
+use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::Display;
 use tracing_subscriber::EnvFilter;
 
@@ -37,7 +38,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         REMOVE_ENV_RUST_LIB_BACKTRACE.store(true, Ordering::Relaxed);
     }
 
-    let is_systemd_service = env::var_os("NOTIFY_SOCKET").is_some();
+    if env::var_os("NOTIFY_SOCKET").is_some() {
+        IS_SYSTEMD_SERVICE.store(true, Ordering::Relaxed);
+
+        #[cfg(not(feature = "systemd"))]
+        warn!(
+            "running as a systemd service, but systemd support is compiled out. \
+             Are you sure you did not forget to set `--features systemd`?"
+        );
+    }
 
     let directives = env::var("RUST_LOG").unwrap_or_else(|_| "niri=debug".to_owned());
     let env_filter = EnvFilter::builder().parse_lossy(directives);
@@ -46,21 +55,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(env_filter)
         .init();
 
-    if is_systemd_service {
-        // If we're starting as a systemd service, assume that the intention is to start on a TTY.
-        // Remove DISPLAY or WAYLAND_DISPLAY from our environment if they are set, since they will
-        // cause the winit backend to be selected instead.
+    let cli = Cli::parse();
+
+    if cli.session {
+        // If we're starting as a session, assume that the intention is to start on a TTY. Remove
+        // DISPLAY or WAYLAND_DISPLAY from our environment if they are set, since they will cause
+        // the winit backend to be selected instead.
         if env::var_os("DISPLAY").is_some() {
-            debug!("we're running as a systemd service but DISPLAY is set, removing it");
+            warn!("running as a session but DISPLAY is set, removing it");
             env::remove_var("DISPLAY");
         }
         if env::var_os("WAYLAND_DISPLAY").is_some() {
-            debug!("we're running as a systemd service but WAYLAND_DISPLAY is set, removing it");
+            warn!("running as a session but WAYLAND_DISPLAY is set, removing it");
             env::remove_var("WAYLAND_DISPLAY");
         }
-    }
 
-    let cli = Cli::parse();
+        // Set the current desktop for xdg-desktop-portal.
+        env::set_var("XDG_CURRENT_DESKTOP", "niri");
+        // Ensure the session type is set to Wayland for xdg-autostart and Qt apps.
+        env::set_var("XDG_SESSION_TYPE", "wayland");
+    }
 
     let _client = tracy_client::Client::start();
 
@@ -149,6 +163,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     animation::ANIMATION_SLOWDOWN.store(slowdown, Ordering::Relaxed);
 
     let spawn_at_startup = mem::take(&mut config.spawn_at_startup);
+    *CHILD_ENV.write().unwrap() = mem::take(&mut config.environment);
 
     // Create the compositor.
     let mut event_loop = EventLoop::try_new().unwrap();
@@ -175,9 +190,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("IPC listening on: {}", ipc.socket_path.to_string_lossy());
     }
 
-    if is_systemd_service {
-        // We're starting as a systemd service. Export our variables.
-        import_env_to_systemd();
+    if cli.session {
+        // We're starting as a session. Import our variables.
+        import_environment();
 
         // Inhibit power key handling so we can suspend on it.
         #[cfg(feature = "dbus")]
@@ -189,7 +204,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     #[cfg(feature = "dbus")]
-    dbus::DBusServers::start(&mut state, is_systemd_service);
+    dbus::DBusServers::start(&mut state, cli.session);
 
     // Notify systemd we're ready.
     if let Err(err) = sd_notify::notify(true, &[NotifyState::Ready]) {
@@ -234,14 +249,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn import_env_to_systemd() {
-    let variables = ["WAYLAND_DISPLAY", niri_ipc::SOCKET_PATH_ENV].join(" ");
+fn import_environment() {
+    let variables = [
+        "WAYLAND_DISPLAY",
+        "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_TYPE",
+        niri_ipc::SOCKET_PATH_ENV,
+    ]
+    .join(" ");
+
+    #[cfg(feature = "systemd")]
+    let systemctl = format!("systemctl --user import-environment {variables} && ");
+    #[cfg(not(feature = "systemd"))]
+    let systemctl = String::new();
 
     let rv = Command::new("/bin/sh")
         .args([
             "-c",
             &format!(
-                "systemctl --user import-environment {variables} && \
+                "{systemctl}\
                  hash dbus-update-activation-environment 2>/dev/null && \
                  dbus-update-activation-environment {variables}"
             ),
@@ -261,7 +287,7 @@ fn import_env_to_systemd() {
             }
         },
         Err(err) => {
-            warn!("error spawning shell to import environment into systemd: {err:?}");
+            warn!("error spawning shell to import environment: {err:?}");
         }
     }
 }

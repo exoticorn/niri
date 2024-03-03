@@ -1,17 +1,17 @@
-use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, GlesTexture};
+use smithay::backend::renderer::gles::element::PixelShaderElement;
+use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer};
 use smithay::backend::renderer::utils::CommitCounter;
 use smithay::utils::{Buffer, Physical, Rectangle, Scale, Transform};
 
 use super::renderer::AsGlesFrame;
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 
-/// Wrapper for a texture from the primary GPU for rendering with the primary GPU.
+/// Wrapper for a poxel shader from the primary GPU for rendering with the primary GPU.
 #[derive(Debug)]
-pub struct PrimaryGpuTextureRenderElement(pub TextureRenderElement<GlesTexture>);
+pub struct PrimaryGpuPixelShaderRenderElement(pub PixelShaderElement);
 
-impl Element for PrimaryGpuTextureRenderElement {
+impl Element for PrimaryGpuPixelShaderRenderElement {
     fn id(&self) -> &Id {
         self.0.id()
     }
@@ -53,7 +53,7 @@ impl Element for PrimaryGpuTextureRenderElement {
     }
 }
 
-impl RenderElement<GlesRenderer> for PrimaryGpuTextureRenderElement {
+impl RenderElement<GlesRenderer> for PrimaryGpuPixelShaderRenderElement {
     fn draw(
         &self,
         frame: &mut GlesFrame<'_>,
@@ -73,7 +73,7 @@ impl RenderElement<GlesRenderer> for PrimaryGpuTextureRenderElement {
     }
 }
 
-impl<'render> RenderElement<TtyRenderer<'render>> for PrimaryGpuTextureRenderElement {
+impl<'render> RenderElement<TtyRenderer<'render>> for PrimaryGpuPixelShaderRenderElement {
     fn draw(
         &self,
         frame: &mut TtyFrame<'_, '_>,

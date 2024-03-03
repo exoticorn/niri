@@ -14,7 +14,6 @@ use smithay::desktop::{PopupKind, PopupManager};
 use smithay::input::pointer::{CursorIcon, CursorImageStatus, PointerHandle};
 use smithay::input::{keyboard, Seat, SeatHandler, SeatState};
 use smithay::output::Output;
-use smithay::reexports::input;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
@@ -298,7 +297,7 @@ impl SecurityContextHandler for State {
                 });
 
                 if let Err(err) = state.niri.display_handle.insert_client(client, data) {
-                    error!("error inserting client: {err}");
+                    warn!("error inserting client: {err}");
                 } else {
                     trace!("inserted a new restricted client, context={context:?}");
                 }
@@ -341,7 +340,7 @@ impl ForeignToplevelHandler for State {
 
     fn close(&mut self, wl_surface: WlSurface) {
         if let Some((window, _)) = self.niri.layout.find_window_and_output(&wl_surface) {
-            window.toplevel().send_close();
+            window.toplevel().expect("no x11 support").send_close();
         }
     }
 
@@ -350,6 +349,7 @@ impl ForeignToplevelHandler for State {
         {
             if !window
                 .toplevel()
+                .expect("no x11 support")
                 .current_state()
                 .capabilities
                 .contains(xdg_toplevel::WmCapabilities::Fullscreen)

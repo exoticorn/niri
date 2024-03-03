@@ -52,6 +52,7 @@ clap = { workspace = true, features = ["string"] }
 directories = "5.0.1"
 futures-util = { version = "0.3.30", default-features = false, features = ["std", "io"] }
 git-version = "0.3.9"
+glam = "0.25.0"
 input = { version = "0.9.0", features = ["libinput_1_21"] }
 keyframe = { version = "1.1.1", default-features = false }
 libc = "0.2.153"
@@ -99,9 +100,11 @@ proptest-derive = "0.4.0"
 xshell = "0.2.5"
 
 [features]
-default = ["dbus", "xdp-gnome-screencast"]
-# Enables DBus support (required for xdp-gnome and power button inhibiting).
+default = ["dbus", "systemd", "xdp-gnome-screencast"]
+# Enables D-Bus support (serve various freedesktop and GNOME interfaces, power button handling).
 dbus = ["zbus", "async-channel", "async-io", "notify-rust", "url"]
+# Enables systemd integration (global environment, apps in transient scopes).
+systemd = ["dbus"]
 # Enables screencasting support through xdg-desktop-portal-gnome.
 xdp-gnome-screencast = ["dbus", "pipewire"]
 # Enables the Tracy profiler instrumentation.

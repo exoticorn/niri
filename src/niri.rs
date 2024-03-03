@@ -41,9 +41,8 @@ use smithay::output::{self, Output};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{
-    self, Idle, Interest, LoopHandle, LoopSignal, Mode, PostAction, RegistrationToken,
+    Idle, Interest, LoopHandle, LoopSignal, Mode, PostAction, RegistrationToken,
 };
-use smithay::reexports::input;
 use smithay::reexports::wayland_protocols::ext::session_lock::v1::server::ext_session_lock_v1::ExtSessionLockV1;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::WmCapabilities;
 use smithay::reexports::wayland_protocols_misc::server_decoration as _server_decoration;
@@ -87,16 +86,13 @@ use smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState;
 
 use crate::backend::tty::SurfaceDmabufFeedback;
 use crate::backend::{Backend, RenderResult, Tty, Winit};
-use crate::config_error_notification::ConfigErrorNotification;
 use crate::cursor::{CursorManager, CursorTextureCache, RenderCursor, XCursor};
 #[cfg(feature = "dbus")]
 use crate::dbus::gnome_shell_screenshot::{NiriToScreenshot, ScreenshotToNiri};
 #[cfg(feature = "xdp-gnome-screencast")]
 use crate::dbus::mutter_screen_cast::{self, ScreenCastToNiri};
-use crate::exit_confirm_dialog::ExitConfirmDialog;
 use crate::frame_clock::FrameClock;
 use crate::handlers::configure_lock_surface;
-use crate::hotkey_overlay::HotkeyOverlay;
 use crate::input::{apply_libinput_settings, TabletData};
 use crate::ipc::server::IpcServer;
 use crate::layout::{Layout, MonitorRenderElement};
@@ -104,10 +100,15 @@ use crate::protocols::foreign_toplevel::{self, ForeignToplevelManagerState};
 use crate::pw_utils::{Cast, PipeWire};
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::{render_to_texture, render_to_vec};
-use crate::screenshot_ui::{ScreenshotUi, ScreenshotUiRenderElement};
+use crate::ui::config_error_notification::ConfigErrorNotification;
+use crate::ui::exit_confirm_dialog::ExitConfirmDialog;
+use crate::ui::hotkey_overlay::HotkeyOverlay;
+use crate::ui::screenshot_ui::{ScreenshotUi, ScreenshotUiRenderElement};
+use crate::utils::spawning::CHILD_ENV;
 use crate::utils::{
     center, get_monotonic_time, make_screenshot_path, output_size, write_png_rgba8,
 };
+use crate::window::Unmapped;
 use crate::{animation, niri_render_elements};
 
 const CLEAR_COLOR: [f32; 4] = [0.2, 0.2, 0.2, 1.];
@@ -133,7 +134,7 @@ pub struct Niri {
     pub global_space: Space<Window>,
 
     // Windows which don't have a buffer attached yet.
-    pub unmapped_windows: HashMap<WlSurface, Window>,
+    pub unmapped_windows: HashMap<WlSurface, Unmapped>,
 
     pub output_state: HashMap<Output, OutputState>,
     pub output_by_name: HashMap<String, Output>,
@@ -143,6 +144,7 @@ pub struct Niri {
 
     pub devices: HashSet<input::Device>,
     pub tablets: HashMap<input::Device, TabletData>,
+    pub touch: HashSet<input::Device>,
 
     // Smithay state.
     pub compositor_state: CompositorState,
@@ -478,7 +480,7 @@ impl State {
                 self.niri
                     .layout
                     .focus()
-                    .map(|win| win.toplevel().wl_surface().clone())
+                    .map(|win| win.toplevel().expect("no x11 support").wl_surface().clone())
             };
             let layer_focus = |surface: &LayerSurface| {
                 surface
@@ -578,7 +580,7 @@ impl State {
     pub fn reload_config(&mut self, path: PathBuf) {
         let _span = tracy_client::span!("State::reload_config");
 
-        let config = match Config::load(&path) {
+        let mut config = match Config::load(&path) {
             Ok(config) => config,
             Err(err) => {
                 warn!("{:?}", err.context("error loading config"));
@@ -598,6 +600,8 @@ impl State {
             config.animations.slowdown.clamp(0., 100.)
         };
         animation::ANIMATION_SLOWDOWN.store(slowdown, Ordering::Relaxed);
+
+        *CHILD_ENV.write().unwrap() = mem::take(&mut config.environment);
 
         let mut reload_xkb = None;
         let mut libinput_config_changed = false;
@@ -952,7 +956,7 @@ impl Niri {
                 });
 
                 if let Err(err) = state.niri.display_handle.insert_client(client, data) {
-                    error!("error inserting client: {err}");
+                    warn!("error inserting client: {err}");
                 }
             })
             .unwrap();
@@ -1004,6 +1008,7 @@ impl Niri {
 
             devices: HashSet::new(),
             tablets: HashMap::new(),
+            touch: HashSet::new(),
 
             compositor_state,
             xdg_shell_state,
@@ -1069,8 +1074,6 @@ impl Niri {
     pub fn inhibit_power_key(&mut self) -> anyhow::Result<()> {
         let conn = zbus::blocking::ConnectionBuilder::system()?.build()?;
 
-        // logind-zbus has a wrong signature for this method, so do it manually.
-        // https://gitlab.com/flukejones/logind-zbus/-/merge_requests/5
         let message = conn.call_method(
             Some("org.freedesktop.login1"),
             "/org/freedesktop/login1",
@@ -1607,6 +1610,14 @@ impl Niri {
             .or_else(|| self.global_space.outputs().next())
     }
 
+    pub fn output_for_touch(&self) -> Option<&Output> {
+        let config = self.config.borrow();
+        let map_to_output = config.input.touch.map_to_output.as_ref();
+        map_to_output
+            .and_then(|name| self.output_by_name.get(name))
+            .or_else(|| self.global_space.outputs().next())
+    }
+
     pub fn output_for_root(&self, root: &WlSurface) -> Option<&Output> {
         // Check the main layout.
         let win_out = self.layout.find_window_and_output(root);
@@ -2092,8 +2103,12 @@ impl Niri {
                 } else {
                     RedrawState::Idle
                 };
-        } else {
-            // Update the lock render state on successful render.
+        }
+
+        // Update the lock render state on successful render, or if monitors are inactive. When
+        // monitors are inactive on a TTY, they have no framebuffer attached, so no sensitive data
+        // from a last render will be visible.
+        if res != RenderResult::Skipped || !self.monitors_active {
             state.lock_render_state = if is_locked {
                 LockRenderState::Locked
             } else {
@@ -2104,27 +2119,23 @@ impl Niri {
         // If we're in process of locking the session, check if the requirements were met.
         match mem::take(&mut self.lock_state) {
             LockState::Locking(confirmation) => {
-                if res == RenderResult::Skipped {
-                    if state.lock_render_state == LockRenderState::Unlocked {
-                        // We needed to render a locked frame on this output but failed.
-                        self.unlock();
-                    } else {
-                        // Rendering failed but this output is already locked, so it's fine.
-                        self.lock_state = LockState::Locking(confirmation);
-                    }
+                if state.lock_render_state == LockRenderState::Unlocked {
+                    // We needed to render a locked frame on this output but failed.
+                    self.unlock();
                 } else {
-                    // Rendering succeeded, check if this was the last output.
+                    // Check if all outputs are now locked.
                     let all_locked = self
                         .output_state
                         .values()
                         .all(|state| state.lock_render_state == LockRenderState::Locked);
 
                     if all_locked {
+                        // All outputs are locked, report success.
                         let lock = confirmation.ext_session_lock().clone();
                         confirmation.lock();
                         self.lock_state = LockState::Locked(lock);
                     } else {
-                        // Still waiting.
+                        // Still waiting for other outputs.
                         self.lock_state = LockState::Locking(confirmation);
                     }
                 }
@@ -2569,7 +2580,7 @@ impl Niri {
                 let elements = elements.iter().rev();
 
                 if let Err(err) = render_to_dmabuf(renderer, dmabuf, size, scale, elements) {
-                    error!("error rendering to dmabuf: {err:?}");
+                    warn!("error rendering to dmabuf: {err:?}");
                     continue;
                 }
 
@@ -2973,7 +2984,7 @@ impl ClientData for ClientState {
 }
 
 niri_render_elements! {
-    OutputRenderElements => {
+    OutputRenderElements<R> => {
         Monitor = MonitorRenderElement<R>,
         Wayland = WaylandSurfaceRenderElement<R>,
         NamedPointer = MemoryRenderBufferRenderElement<R>,
